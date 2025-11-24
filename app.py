@@ -7,201 +7,159 @@ import io
 from flask import Flask
 from datetime import datetime
 import pytz
-import os
-from bs4 import BeautifulSoup
+
+# --- CẤU HÌNH (ĐIỀN LẠI TOKEN VÀ ID CỦA BẠN) ---
+TOKEN = '8309991075:AAFYyjFxQQ8CYECXPKeteeUBXQE3Mx2yfUo'  # <-- NHỚ ĐIỀN LẠI TOKEN
+CHAT_ID = '5464507208'                    # <-- NHỚ ĐIỀN LẠI CHAT ID
 
 app = Flask(__name__)
 
-# --- CẤU HÌNH ---
-TOKEN = os.environ.get('TOKEN', '8309991075:AAFYyjFxQQ8CYECXPKeteeUBXQE3Mx2yfUo') 
-CHAT_ID = os.environ.get('CHAT_ID', '5464507208') 
-
-# Đã đổi GC=F thành XAUUSD=X để tăng ổn định
-TICKERS = {
-    'GOLD': 'XAUUSD=X', # Đã đổi sang Gold Spot Index (ổn định hơn Futures)
-    'GVZ': '^GVZ',    
-    'VIX': '^VIX',    
-    'US10Y': '^TNX',  
-    'FED_FUT': 'ZQ=F' 
+# --- CẤU HÌNH NGƯỠNG CẢNH BÁO MỚI ---
+THRESHOLDS = {
+    'VIX_DANGER': 30,           # VIX >= 30 (Sợ hãi cực độ)
+    'VIX_CHANGE_PCT': 10.0,     # Chỉ báo khi VIX TĂNG >= 10% (Giảm không báo)
+    'GVZ_DANGER': 25,           # GVZ >= 25
+    'GVZ_CHANGE_PCT': 10.0,     # GVZ Tăng >= 10%
+    'US10Y_CHANGE': 0.25,       # Yield biến động 0.25 điểm
+    'GOLD_MOVE_DOLLARS': 50.0,  # Vàng chạy 50$ = 500 pips (Mới sửa)
+    'SPDR_CHANGE_TONS': 5.0,    # Quỹ mua/bán > 5 tấn
 }
 
-# --- 1. HÀM DATA SPDR ---
+MSG_ID_FILE = "msg_id.txt"
+
+# --- HÀM LẤY DỮ LIỆU ---
 def get_spdr_data():
     try:
         url = "https://www.spdrgoldshares.com/assets/dynamic/GLD/GLD_US_archive_EN.csv"
-        s = requests.get(url, verify=False, timeout=5).content
-        df = pd.read_csv(io.BytesIO(s), skiprows=1)
-        df = df[['Date', 'Total Net Asset Value Tonnes']].dropna().tail(5)
-        return df
-    except: return None
-
-# --- 2. HÀM QUÉT TIN TỨC ---
-def check_geopolitics_news():
-    try:
-        url = "https://news.google.com/rss/topics/CAAqJggBCiJCAQAqSVgQASowCacGJQindUBKX/sections/CAQiSkIBCipJWUABKh0ICjIJY29tOmlkOnduL2JtL21pbGl0YXJ5X3dhcgoXCAoiCWNvbTppZDp3bi9ibS9taWxpdGFyeV93YXI?hl=en-US&gl=US&ceid=US%3Aen"
-        response = requests.get(url, timeout=5)
-        soup = BeautifulSoup(response.content, features="xml")
-        items = soup.findAll('item')
+        s = requests.get(url, timeout=5).content
+        df = pd.read_csv(io.StringIO(s.decode('utf-8')), skiprows=6)
+        df = df[['Date', 'Total Net Asset Value Tonnes in the Trust']].dropna().tail(5)
         
-        keywords = ['nuclear', 'missile', 'invasion', 'airstrike', 'war declared', 'conflict escalation', 'biden', 'putin', 'iran', 'israel']
-        news_alerts = []
+        last_row = df.iloc[-1]
+        prev_row = df.iloc[-2]
         
-        for item in items[:3]:
-            title = item.title.text.lower()
-            for key in keywords:
-                if key in title:
-                    orig_link = item.link.text
-                    news_alerts.append(f"📰 <b>TIN NÓNG ({key.upper()}):</b>\n{item.title.text}\n(<a href='{orig_link}'>Xem chi tiết</a>)")
-                    break 
-        return news_alerts
-    except: return []
+        tonnes_now = float(last_row['Total Net Asset Value Tonnes in the Trust'])
+        change = tonnes_now - float(prev_row['Total Net Asset Value Tonnes in the Trust'])
+        
+        # Check chuỗi 3 ngày
+        diffs = df['Total Net Asset Value Tonnes in the Trust'].diff().tail(3)
+        streak_buy = all(diffs > 0)
+        streak_sell = all(diffs < 0)
+        
+        return {'tonnes': tonnes_now, 'change': change, 'streak_buy': streak_buy, 'streak_sell': streak_sell}
+    except:
+        return {'tonnes': 0, 'change': 0, 'streak_buy': False, 'streak_sell': False}
 
-async def send_telegram(message, is_alert=False):
-    try:
-        bot = telegram.Bot(token=TOKEN)
-        sent_msg = await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML', disable_web_page_preview=True)
-        if is_alert:
-            try: await bot.pin_chat_message(chat_id=CHAT_ID, message_id=sent_msg.message_id)
-            except: pass
-    except Exception as e: print(f"Lỗi Telegram: {e}")
-
-# --- 3. HÀM PHÂN TÍCH CHÍNH ---
-def analyze_market():
-    alerts = []
-    report_lines = []
+async def logic_check_market():
+    bot = telegram.Bot(token=TOKEN)
+    alerts = [] 
     
-    # Gộp tải dữ liệu Daily và H1 vào 1 lần duy nhất để tối ưu và ổn định
-    # Tải dữ liệu Daily (2d) và H1 (1d)
     try:
-        # Lấy data Daily (cho % change)
-        daily_data = yf.download(list(TICKERS.values()), period="2d", progress=False)['Close']
-        # Lấy data H1 (cho Vàng spread)
-        h1_data = yf.download(TICKERS['GOLD'], period="1d", interval="1h", progress=False)
-    except Exception as e:
-        alerts.append(f"❌ <b>LỖI TẢI DỮ LIỆU:</b> Không thể kết nối YFinance. Vui lòng kiểm tra lại dịch vụ.")
-        report_lines.append(f"Lỗi: {e}")
-        return alerts, "\n".join(report_lines)
+        tickers = ["GC=F", "^GVZ", "^VIX", "^TNX", "^IRX"] 
+        data = yf.download(tickers, period="2d", interval="1d", progress=False)
+        
+        def get_val(ticker):
+            try:
+                closes = data['Close'][ticker].dropna()
+                if len(closes) < 2: return 0, 0, 0
+                curr = closes.iloc[-1]
+                prev = closes.iloc[-2]
+                chg = curr - prev
+                pct = (chg / prev) * 100 if prev != 0 else 0
+                return round(curr, 2), round(chg, 2), round(pct, 2)
+            except: return 0, 0, 0
 
-    # --- HÀM TRUY CẬP DATA (Đảm bảo giá trị không phải NaN) ---
-    def get_value(df, ticker, column='Close'):
+        gold_price, gold_chg, gold_pct = get_val("GC=F")
+        gvz_val, gvz_chg, gvz_pct = get_val("^GVZ")
+        vix_val, vix_chg, vix_pct = get_val("^VIX")
+        us10y_val, us10y_chg, us10y_pct = get_val("^TNX")
+        us02y_val, us02y_chg, us02y_pct = get_val("^IRX")
+
+        # --- LOGIC CẢNH BÁO (ĐÃ SỬA) ---
+        
+        # 1. VIX (Chỉ báo khi TĂNG > 10% hoặc Mức > 30)
+        if vix_val >= THRESHOLDS['VIX_DANGER']:
+            alerts.append(f"🔴 **NGUY HIỂM:** VIX đạt {vix_val} (Rủi ro cao)")
+        if vix_pct >= THRESHOLDS['VIX_CHANGE_PCT']: # Bỏ abs(), chỉ lấy số dương
+            alerts.append(f"⚠️ **VIX BÙNG NỔ:** Tăng +{vix_pct}%")
+
+        # 2. GVZ (Chỉ báo khi TĂNG hoặc mức cao)
+        if gvz_val >= THRESHOLDS['GVZ_DANGER']:
+            alerts.append(f"🌪 **BÃO VÀNG:** GVZ đạt {gvz_val}")
+        if gvz_pct >= THRESHOLDS['GVZ_CHANGE_PCT']:
+            alerts.append(f"⚠️ **GVZ TĂNG MẠNH:** +{gvz_pct}%")
+
+        # 3. US10Y (Giữ nguyên)
+        if abs(us10y_chg) >= THRESHOLDS['US10Y_CHANGE']:
+            trend = "TĂNG" if us10y_chg > 0 else "GIẢM"
+            alerts.append(f"🇺🇸 **US10Y:** {trend} {abs(us10y_chg)} điểm")
+
+        # 4. SPDR
+        spdr = get_spdr_data()
+        if abs(spdr['change']) >= THRESHOLDS['SPDR_CHANGE_TONS']:
+            action = "MUA GOM" if spdr['change'] > 0 else "XẢ HÀNG"
+            alerts.append(f"🐋 **SPDR {action}:** {abs(round(spdr['change'], 2))} tấn")
+
+        # 5. VÀNG (Sửa thành 50$ = 500 pips)
+        if abs(gold_chg) >= THRESHOLDS['GOLD_MOVE_DOLLARS']:
+            pips = int(abs(gold_chg) * 10) # 1$ = 10 pips
+            alerts.append(f"💰 **VÀNG BIẾN ĐỘNG:** {gold_chg}$ (~{pips} pips)")
+            
+        # 6. LÃI SUẤT 2 NĂM (US02Y)
+        if abs(us02y_chg) >= 0.2:
+            alerts.append(f"🏦 **LÃI SUẤT US02Y:** Biến động {us02y_chg}%")
+
+        # --- GỬI CẢNH BÁO RIÊNG (NẾU CÓ) ---
+        if alerts:
+            await bot.send_message(chat_id=CHAT_ID, text="\n".join(alerts), parse_mode='Markdown')
+
+        # --- CẬP NHẬT DASHBOARD (UPDATE IM LẶNG) ---
+        vn_tz = pytz.timezone('Asia/Ho_Chi_Minh')
+        time_str = datetime.now(vn_tz).strftime('%H:%M %d/%m')
+        
+        # Icon trạng thái
+        vix_icon = '🟢' if vix_pct < 0 else ('🔴' if vix_pct > 5 else '🟡')
+        gold_icon = '📈' if gold_chg > 0 else '📉'
+        
+        dashboard_msg = f"""
+📊 **MARKET MONITOR** ({time_str})
+-----------------------------
+🥇 **Gold:** {gold_price} ({gold_icon} {gold_chg}$)
+🌊 **GVZ:** {gvz_val} ({gvz_pct}%)
+{vix_icon} **VIX:** {vix_val} ({vix_pct}%)
+🇺🇸 **US10Y:** {us10y_val}% (Var: {us10y_chg})
+🐋 **SPDR:** {spdr['tonnes']} tấn ({spdr['change']:+.2f})
+-----------------------------
+_Vàng biến động >500 pips hoặc VIX tăng >10% mới báo_
+        """
+        
         try:
-            val = df.loc[:, ticker].iloc[-1]
-            # Nếu giá trị là NaN (lỗi tải) thì trả về 0 để tránh crash
-            return val if pd.notna(val) else 0.0
+            with open(MSG_ID_FILE, "r") as f:
+                saved_id = int(f.read().strip())
+            await bot.edit_message_text(chat_id=CHAT_ID, message_id=saved_id, text=dashboard_msg, parse_mode='Markdown')
         except:
-            return 0.0
+            m = await bot.send_message(chat_id=CHAT_ID, text=dashboard_msg, parse_mode='Markdown')
+            with open(MSG_ID_FILE, "w") as f:
+                f.write(str(m.message_id))
+            try: await bot.pin_chat_message(chat_id=CHAT_ID, message_id=m.message_id)
+            except: pass
 
-    # --- Xử lý từng Mã ---
+    except Exception as e:
+        print(f"Error: {e}")
 
-    # 1. GVZ (Biến động Vàng)
+# --- SERVER ---
+@app.route('/')
+def home(): return "Bot OK", 200
+
+@app.route('/run_check')
+def run_check():
     try:
-        gvz_now = get_value(daily_data, TICKERS['GVZ'])
-        gvz_prev = daily_data.loc[:, TICKERS['GVZ']].iloc[-2] if len(daily_data.loc[:, TICKERS['GVZ']]) >= 2 else 0.0
-        gvz_pct = ((gvz_now - gvz_prev) / gvz_prev) * 100 if gvz_prev != 0 else 0.0
-        
-        report_lines.append(f"🌊 <b>GVZ:</b> {gvz_now:.2f} ({gvz_pct:+.2f}%)")
-        if gvz_pct > 10 or gvz_now > 25:
-            alerts.append(f"⚠️ <b>GVZ BÁO ĐỘNG:</b> {gvz_now:.2f} (Tăng {gvz_pct:.1f}%)")
-    except: pass
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(logic_check_market())
+        loop.close()
+        return "Checked", 200
+    except Exception as e: return str(e), 500
 
-    # 2. VIX (Sợ hãi)
-    try:
-        vix_now = get_value(daily_data, TICKERS['VIX'])
-        vix_prev = daily_data.loc[:, TICKERS['VIX']].iloc[-2] if len(daily_data.loc[:, TICKERS['VIX']]) >= 2 else 0.0
-        vix_pct = ((vix_now - vix_prev) / vix_prev) * 100 if vix_prev != 0 else 0.0
-        
-        report_lines.append(f"😱 <b>VIX:</b> {vix_now:.2f} ({vix_pct:+.2f}%)")
-        
-        if vix_pct > 15 or vix_now > 30:
-            alerts.append(f"⚠️ <b>VIX SỢ HÃI CAO:</b> {vix_now:.2f} (Tăng {vix_pct:.1f}%)")
-    except: pass
-
-    # 3. US10Y
-    try:
-        us10y_now_raw = get_value(daily_data, TICKERS['US10Y'])
-        us10y_prev_raw = daily_data.loc[:, TICKERS['US10Y']].iloc[-2] if len(daily_data.loc[:, TICKERS['US10Y']]) >= 2 else 0.0
-        
-        us10y_now = us10y_now_raw / 10
-        us10y_prev = us10y_prev_raw / 10
-        change = us10y_now - us10y_prev
-        
-        report_lines.append(f"🇺🇸 <b>US10Y:</b> {us10y_now:.3f}% (Var: {change:+.3f})")
-        if abs(change) > 0.25:
-            alerts.append(f"⚠️ <b>LÃI SUẤT MỸ BIẾN ĐỘNG:</b> {change:+.3f} điểm")
-    except: pass
-
-    # 4. FEDWATCH (ZQ=F)
-    try:
-        fed_fut_now = get_value(daily_data, TICKERS['FED_FUT'])
-        fed_fut_prev = daily_data.loc[:, TICKERS['FED_FUT']].iloc[-2] if len(daily_data.loc[:, TICKERS['FED_FUT']]) >= 2 else 100.0
-        
-        rate_now = 100 - fed_fut_now
-        rate_prev = 100 - fed_fut_prev
-        
-        rate_pct_change = ((rate_now - rate_prev) / rate_prev) * 100 if rate_prev != 0 else 0.0
-        
-        report_lines.append(f"🏦 <b>Fed Expectation:</b> {rate_now:.2f}% ({rate_pct_change:+.1f}%)")
-
-        if abs(rate_pct_change) > 5.0:
-            trend = "TĂNG" if rate_pct_change > 0 else "GIẢM"
-            alerts.append(f"🏦 <b>FED PIVOT:</b> Kỳ vọng lãi suất {trend} mạnh ({abs(rate_pct_change):.1f}%)")
-    except: pass
-
-    # 5. XAUUSD (Nến H1)
-    try:
-        # Sử dụng h1_data đã tải riêng cho Gold Spot
-        if not h1_data.empty:
-            spread = h1_data['High'].iloc[-1] - h1_data['Low'].iloc[-1]
-            current = h1_data['Close'].iloc[-1]
-            pips = spread * 10 
-            
-            report_lines.append(f"🥇 <b>GOLD:</b> {current:.1f} (H1: {spread:.1f}$ ~ {pips:.0f} pips)")
-            
-            if spread > 40.0: # 40$ spread = 400 pips
-                alerts.append(f"⚠️ <b>VÀNG CHẠY MẠNH (H1):</b> {spread:.1f}$ (~{pips:.0f} pips)")
-        else:
-            report_lines.append(f"🥇 <b>GOLD:</b> N/A (Lỗi tải H1)")
-    except: 
-        report_lines.append(f"🥇 <b>GOLD:</b> N/A (Lỗi xử lý)")
-        
-    # 6. SPDR
-    try:
-        spdr_df = get_spdr_data()
-        if spdr_df is not None:
-            today = float(spdr_df.iloc[-1]['Total Net Asset Value Tonnes'])
-            chg = today - float(spdr_df.iloc[-2]['Total Net Asset Value Tonnes'])
-            report_lines.append(f"🐳 <b>SPDR:</b> {today:.2f} tấn ({chg:+.2f} tấn)")
-            
-            if abs(chg) > 5:
-                act = "GOM" if chg > 0 else "XẢ"
-                alerts.append(f"⚠️ <b>CÁ VOI SPDR {act}:</b> {abs(chg):.2f} TẤN")
-            
-            last3 = spdr_df.tail(4)['Total Net Asset Value Tonnes'].diff().dropna().tail(3)
-            if all(x > 0 for x in last3): alerts.append("⚠️ <b>SPDR:</b> Mua ròng 3 ngày")
-            elif all(x < 0 for x in last3): alerts.append("⚠️ <b>SPDR:</b> Bán ròng 3 ngày")
-    except: report_lines.append("SPDR: N/A")
-
-    # 7. CHECK TIN TỨC
-    news_alerts = check_geopolitics_news()
-    if news_alerts: alerts.extend(news_alerts)
-
-    return alerts, "\n".join(report_lines)
-
-@app.route('/run_bot')
-def run_bot():
-    alerts, report = analyze_market()
-    now = datetime.now(pytz.timezone('Asia/Ho_Chi_Minh'))
-    
-    if alerts:
-        msg = "🚨 <b>CẢNH BÁO RỦI RO</b> 🚨\n\n" + "\n".join(alerts)
-        asyncio.run(send_telegram(msg, is_alert=True))
-    
-    if now.minute == 0: 
-        msg = f"📊 <b>MARKET UPDATE</b> ({now.strftime('%H:%M')})\n{'-'*20}\n{report}\n{'-'*20}\n<i>Bot check news & risk every min</i>"
-        asyncio.run(send_telegram(msg, is_alert=False))
-        return "Sent Report"
-    
-    return "Checked"
-
-if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
