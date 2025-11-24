@@ -11,8 +11,8 @@ app = Flask(__name__)
 # CẤU HÌNH (CONFIG)
 # ==============================================================================
 CONFIG = {
-    "TELEGRAM_TOKEN": "8309991075:AAGxxxxxxxxxxxx",  # <-- ĐIỀN TOKEN
-    "TELEGRAM_CHAT_ID": "546450726x",               # <-- ĐIỀN CHAT ID
+    "TELEGRAM_TOKEN": "8309991075:AAFYyjFxQQ8CYECXPKeteeUBXQE3Mx2yfUo",  # <-- ĐIỀN TOKEN
+    "TELEGRAM_CHAT_ID": "5464507208",               # <-- ĐIỀN CHAT ID
     
     # --- NGƯỠNG KÍCH HOẠT CẢNH BÁO KHẨN CẤP ---
     "VIX_LIMIT": 30,          # VIX > 30 là hoảng loạn
