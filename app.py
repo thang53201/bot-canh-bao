@@ -30,11 +30,23 @@ THRESHOLDS = {
 }
 
 NEWS_KEYWORDS = ["war", "nuclear", "attack", "cpi", "nfp", "fed rate", "powell", "inflation", "escalation"]
-STATE_FILE = "bot_state.json"
+
+# Lưu vào thư mục /tmp để tránh lỗi quyền ghi trên Render
+STATE_FILE = "/tmp/bot_state.json"
+
+# --- BỘ NHỚ RAM (QUAN TRỌNG ĐỂ CHỐNG SPAM) ---
+# Biến này sẽ sống trong RAM, bất chấp file bị lỗi
+_RAM_STATE = None
 
 # --- HÀM QUẢN LÝ TRẠNG THÁI ---
 def load_state():
-    # Mặc định ban đầu
+    global _RAM_STATE
+    
+    # 1. Ưu tiên lấy từ RAM trước (Nhanh và không bao giờ mất khi đang chạy)
+    if _RAM_STATE is not None:
+        return _RAM_STATE
+
+    # 2. Nếu RAM chưa có, mới tìm file
     default_state = {
         "msg_id": None,
         "last_dash_time": 0,
@@ -44,41 +56,47 @@ def load_state():
             "gvz_high": False, "gvz_jump": False,
             "us10y": False, "us02y": False,
             "spdr": False, 
-            "h1_hour": -1, # Lưu giờ đã báo nến H1 (0-23)
+            "h1_hour": -1,
             "news": []
         }
     }
+    
     try:
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE, 'r') as f:
                 saved = json.load(f)
-                # Merge key mới vào nếu file cũ thiếu
+                # Merge key mới vào tránh lỗi
                 for k, v in default_state.items():
                     if k not in saved: saved[k] = v
+                _RAM_STATE = saved # Cập nhật vào RAM
                 return saved
     except: pass
+    
+    _RAM_STATE = default_state
     return default_state
 
 def save_state(state):
+    global _RAM_STATE
     try:
+        _RAM_STATE = state # Luôn cập nhật RAM
         with open(STATE_FILE, 'w') as f:
             json.dump(state, f)
-    except: pass
+    except Exception as e:
+        print(f"Không ghi được file (không sao, đã có RAM): {e}")
 
-# --- CÁC HÀM LẤY DATA (GIỮ NGUYÊN BẢN FIX VÀNG) ---
+# --- CÁC HÀM LẤY DATA (GIỮ NGUYÊN) ---
 def get_gold_spot_price():
     try:
-        url = "https://data-asg.goldprice.org/dbXRates/USD"
-        headers = {'User-Agent': 'Mozilla/5.0', 'Referer': 'https://goldprice.org/'}
-        resp = requests.get(url, headers=headers, timeout=5)
-        return float(resp.json()['items'][0]['xauPrice'])
-    except:
-        try:
-            url = "https://query2.finance.yahoo.com/v8/finance/chart/GC=F?interval=1m&range=1d"
-            headers = {'User-Agent': 'Mozilla/5.0'}
-            resp = requests.get(url, headers=headers, timeout=5)
-            return float(resp.json()['chart']['result'][0]['meta']['regularMarketPrice'])
-        except: return 0.0
+        ticker = yf.Ticker("GC=F")
+        price = ticker.fast_info.last_price
+        if price and price > 0: return float(price)
+        ticker_spot = yf.Ticker("XAUUSD=X")
+        price_spot = ticker_spot.fast_info.last_price
+        if price_spot and price_spot > 0: return float(price_spot)
+        hist = ticker.history(period="1d")
+        if not hist.empty: return float(hist['Close'].iloc[-1])
+        return 0.0
+    except: return 0.0
 
 def get_spdr_data():
     try:
@@ -122,17 +140,16 @@ async def logic_check_market():
     today_str = now_vn.strftime('%Y-%m-%d')
     current_hour = now_vn.hour
     
-    # Reset ngày mới
+    # 1. Reset Logic Ngày Mới
     if state['date_str'] != today_str:
         state['date_str'] = today_str
-        # Reset các cờ báo động trong ngày
         state['alerts_triggered'] = {k: False if k != 'news' else [] for k, v in state['alerts_triggered'].items()}
         state['alerts_triggered']['news'] = []
         state['alerts_triggered']['h1_hour'] = -1
 
-    alerts = [] # Danh sách cảnh báo MỚI
+    alerts = [] 
 
-    # Lấy Data
+    # 2. Lấy Data
     gold_now = get_gold_spot_price()
     tickers = ["^VIX", "^GVZ", "^TNX", "^IRX", "GC=F"]
     data = await loop.run_in_executor(None, lambda: yf.download(tickers, period="2d", interval="1d", progress=False, auto_adjust=True))
@@ -156,9 +173,9 @@ async def logic_check_market():
     if gold_now == 0.0: gold_now = gold_d_val
     realtime_gold_chg = round(gold_now - (gold_d_val - gold_d_chg), 2) if gold_d_val else gold_d_chg
 
-    # --- CHECK ALERT (CÓ STATE ĐỂ CHỐNG SPAM) ---
+    # --- 3. KIỂM TRA ALERT ---
     
-    # 1. VIX
+    # VIX
     if vix_val > THRESHOLDS['VIX_HIGH'] and not state['alerts_triggered']['vix_high']:
         alerts.append(f"🔴 **VIX NGUY HIỂM:** {vix_val}")
         state['alerts_triggered']['vix_high'] = True
@@ -166,12 +183,12 @@ async def logic_check_market():
         alerts.append(f"⚠️ **VIX BÙNG NỔ:** +{vix_pct}%")
         state['alerts_triggered']['vix_jump'] = True
 
-    # 2. GVZ
+    # GVZ
     if (gvz_pct >= THRESHOLDS['GVZ_CHANGE_PCT'] or gvz_val > THRESHOLDS['GVZ_HIGH']) and not state['alerts_triggered']['gvz_jump']:
          alerts.append(f"⚠️ **GVZ TĂNG MẠNH:** +{gvz_pct}% (Val: {gvz_val})")
          state['alerts_triggered']['gvz_jump'] = True
 
-    # 3. Yields
+    # Yields
     if abs(us10_chg) >= THRESHOLDS['US10Y_CHANGE'] and not state['alerts_triggered']['us10y']:
         alerts.append(f"🇺🇸 **US10Y BIẾN ĐỘNG:** {us10_chg:+.2f} điểm")
         state['alerts_triggered']['us10y'] = True
@@ -179,14 +196,13 @@ async def logic_check_market():
         alerts.append(f"🏦 **US02Y BIẾN ĐỘNG:** {us02_chg:+.2f} điểm")
         state['alerts_triggered']['us02y'] = True
 
-    # 4. SPDR
+    # SPDR
     spdr = get_spdr_data()
     if (abs(spdr['change']) >= THRESHOLDS['SPDR_CHANGE_TONS'] or spdr['streak_buy'] or spdr['streak_sell']) and not state['alerts_triggered']['spdr']:
         alerts.append(f"🐋 **SPDR:** {spdr['change']:+.2f} tấn")
         state['alerts_triggered']['spdr'] = True
 
-    # 5. Gold H1 (QUAN TRỌNG: FIX SPAM TẠI ĐÂY)
-    # Chỉ check H1 nếu giờ hiện tại KHÁC giờ đã báo
+    # H1 Candle
     if not data_h1.empty:
         try:
             if isinstance(data_h1.columns, pd.MultiIndex):
@@ -202,41 +218,44 @@ async def logic_check_market():
                 low = float(data_h1['Low'].iloc[-1])
 
             h1_range = high - low
-            
-            # Logic chống spam: Chỉ báo 1 lần cho mỗi cây nến giờ
-            # Nếu range > 40 VÀ (chưa báo giờ này HOẶC giờ này khác giờ báo cũ)
             last_alert_hour = state['alerts_triggered'].get('h1_hour', -1)
             
             if h1_range >= THRESHOLDS['GOLD_H1_MOVE'] and last_alert_hour != current_hour:
                 alerts.append(f"🔥 **H1 BIẾN ĐỘNG:** {h1_range:.1f}$")
-                state['alerts_triggered']['h1_hour'] = current_hour # Đánh dấu đã báo giờ này
-                
+                state['alerts_triggered']['h1_hour'] = current_hour 
         except: pass
 
-    # 6. News
+    # News
     news_alerts, updated_news = check_sensitive_news(state['alerts_triggered']['news'])
     if news_alerts:
         alerts.extend(news_alerts)
         state['alerts_triggered']['news'] = updated_news
 
-    # --- QUYẾT ĐỊNH GỬI TIN ---
-    # Chỉ gửi khi: Có Alert MỚI hoặc Đã quá 30 phút
+    # --- 4. QUYẾT ĐỊNH GỬI (ĐÃ FIX LOGIC) ---
     
     last_dash = datetime.fromtimestamp(state['last_dash_time'], tz=vn_tz)
     diff_mins = (now_vn - last_dash).total_seconds() / 60
     
-    should_send = False
+    # LOGIC CHỐNG SPAM:
+    # Nếu chưa từng gửi lần nào (lần đầu chạy bot) -> Gán thời gian hiện tại vào luôn và KHÔNG GỬI, trừ khi có ALERT.
+    # Điều này giúp bot khi restart không spam "Market Monitor"
+    if state['last_dash_time'] == 0 and not alerts:
+        state['last_dash_time'] = now_vn.timestamp()
+        save_state(state)
+        return # Thoát luôn, không gửi
     
-    # Nếu có cảnh báo khẩn cấp -> Gửi ngay
+    should_send_dash = False
+    
+    # Nếu có Alert -> Gửi Alert ngay lập tức
     if alerts:
         await bot.send_message(chat_id=CHAT_ID, text="🚨 **CẢNH BÁO:**\n" + "\n".join(alerts), parse_mode='Markdown')
-        should_send = True # Gửi luôn dashboard cập nhật kèm theo
+        should_send_dash = True # Kèm luôn dashboard cho tiện theo dõi
 
-    # Logic gửi định kỳ 30 phút
+    # Nếu đã quá 30 phút -> Gửi Dashboard
     if diff_mins >= 30:
-        should_send = True
+        should_send_dash = True
 
-    if should_send:
+    if should_send_dash:
         time_str = now_vn.strftime('%H:%M %d/%m')
         gold_icon = '📈' if realtime_gold_chg > 0 else '📉'
         
@@ -253,20 +272,16 @@ async def logic_check_market():
 _Cập nhật mỗi 30p hoặc khi có biến động_
         """
         
-        # Xóa tin cũ để đỡ rác (nếu được)
+        # Xóa tin cũ
         try:
             if state['msg_id']:
                 await bot.delete_message(chat_id=CHAT_ID, message_id=state['msg_id'])
         except: pass
         
-        # Gửi tin mới
         sent = await bot.send_message(chat_id=CHAT_ID, text=dashboard, parse_mode='Markdown')
-        
-        # Ghim tin
         try: await bot.pin_chat_message(chat_id=CHAT_ID, message_id=sent.message_id)
         except: pass
         
-        # Lưu lại trạng thái
         state['msg_id'] = sent.message_id
         state['last_dash_time'] = now_vn.timestamp()
 
