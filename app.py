@@ -6,8 +6,8 @@ from flask import Flask
 from threading import Thread
 
 # --- CẤU HÌNH (Điền thông tin của bạn vào đây) ---
-TOKEN = 'ĐIỀN_TOKEN_CỦA_BẠN_VÀO_ĐÂY'
-CHAT_ID = 'ĐIỀN_CHAT_ID_CỦA_BẠN_VÀO_ĐÂY'
+TOKEN = '8309991075:AAFYyjFxQQ8CYECXPKeteeUBXQE3Mx2yfUo'
+CHAT_ID = '5464507208'
 # Mẹo: Chat với @userinfobot để lấy CHAT_ID, chat với @BotFather để lấy TOKEN
 
 app = Flask(__name__)
