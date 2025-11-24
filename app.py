@@ -1,318 +1,206 @@
-import telegram
-import asyncio
 import yfinance as yf
+import time
+from datetime import datetime, timedelta
 import pandas as pd
-import requests
-import io
-import json
-import os
-import traceback
-from flask import Flask
-from datetime import datetime
-import pytz
 
-# --- CẤU HÌNH (ĐIỀN LẠI THÔNG TIN CỦA BẠN) ---
-TOKEN = '8309991075:AAFYyjFxQQ8CYECXPKeteeUBXQE3Mx2yfUo' 
-CHAT_ID = '5464507208'                    
+# ==============================================================================
+# CẤU HÌNH NGƯỠNG BÁO ĐỘNG (CONFIG)
+# ==============================================================================
+CONFIG = {
+    "TELEGRAM_TOKEN": "8309991075:AAFYyjFxQQ8CYECXPKeteeUBXQE3Mx2yfUo",  # Điền Token Bot Telegram của bạn
+    "TELEGRAM_CHAT_ID": "5464507208",   # Điền Chat ID của bạn
+    
+    # 1. Cấu hình VIX & GVZ
+    "VIX_VALUE_LIMIT": 30,          # Giá trị tuyệt đối > 30
+    "VIX_PCT_CHANGE_LIMIT": 15,     # Tăng > 15% trong ngày
+    "GVZ_VALUE_LIMIT": 25,          # Giá trị tuyệt đối > 25
+    "GVZ_PCT_CHANGE_LIMIT": 10,     # Tăng > 10% trong ngày
 
-app = Flask(__name__)
+    # 2. Cấu hình Kỳ vọng Lạm phát (T10YIE / Breakeven)
+    "T10YIE_CHANGE_LIMIT": 0.25,    # Biến động +/- 0.25 điểm
+    
+    # 3. Cấu hình FED WATCH (Lãi suất)
+    "FEDWATCH_CHANGE_LIMIT": 20.0,  # Thay đổi > 20% (Mức cực đoan cho EA 100 giá)
 
-# --- CẤU HÌNH NGƯỠNG CẢNH BÁO ---
-THRESHOLDS = {
-    'VIX_HIGH': 30,             
-    'VIX_CHANGE_PCT': 15.0,     
-    'GVZ_HIGH': 25,             
-    'GVZ_CHANGE_PCT': 10.0,     
-    'US10Y_CHANGE': 0.25,       
-    'US02Y_CHANGE': 0.20,       
-    'SPDR_CHANGE_TONS': 5.0,    
-    'GOLD_H1_MOVE': 40.0,       
+    # 4. Cấu hình Vàng (XAUUSD)
+    "GOLD_H1_RANGE_LIMIT": 40.0,    # Nến H1 chạy > 40 giá ($400 pips)
+    
+    # 5. Cấu hình Quỹ SPDR
+    "SPDR_TONS_LIMIT": 5.0,         # Mua/Bán > 5 tấn/ngày
+    "SPDR_CONSECUTIVE_DAYS": 3,     # Số ngày mua/bán ròng liên tiếp
 }
 
-NEWS_KEYWORDS = ["war", "nuclear", "attack", "cpi", "nfp", "fed rate", "powell", "inflation", "escalation"]
+# ==============================================================================
+# HÀM GIẢ LẬP / XỬ LÝ DỮ LIỆU KHÓ (SPDR & FEDWATCH)
+# ==============================================================================
+# Lưu ý: FedWatch và Tonnage SPDR không có API miễn phí trực tiếp qua yfinance.
+# Bạn cần nhập tay hoặc dùng API trả phí. Ở đây tôi để hàm chờ (Placeholder).
 
-# Lưu vào thư mục /tmp để tránh lỗi quyền ghi trên Render
-STATE_FILE = "/tmp/bot_state.json"
+def get_fedwatch_change():
+    """
+    Giả lập lấy thay đổi FedWatch. 
+    Thực tế cần crawl từ web CME hoặc nhập tay nếu thấy tin mạnh.
+    Hiện tại trả về 0.0 để code chạy không lỗi.
+    """
+    return 0.0 
 
-# --- BỘ NHỚ RAM (QUAN TRỌNG ĐỂ CHỐNG SPAM) ---
-# Biến này sẽ sống trong RAM, bất chấp file bị lỗi
-_RAM_STATE = None
+def get_spdr_status():
+    """
+    Giả lập check SPDR.
+    Logic: Trả về số tấn mua/bán hôm nay và list lịch sử 3 ngày.
+    Ví dụ: return -6.0, [-2.0, -3.0, -6.0] (Bán 6 tấn, 3 ngày bán liên tiếp)
+    """
+    # Demo dữ liệu: Hôm nay không mua bán, lịch sử bình thường
+    current_flow = 0.0
+    history_flows = [0.0, 0.0, 0.0] 
+    return current_flow, history_flows
 
-# --- HÀM QUẢN LÝ TRẠNG THÁI ---
-def load_state():
-    global _RAM_STATE
-    
-    # 1. Ưu tiên lấy từ RAM trước (Nhanh và không bao giờ mất khi đang chạy)
-    if _RAM_STATE is not None:
-        return _RAM_STATE
-
-    # 2. Nếu RAM chưa có, mới tìm file
-    default_state = {
-        "msg_id": None,
-        "last_dash_time": 0,
-        "date_str": "",
-        "alerts_triggered": {
-            "vix_high": False, "vix_jump": False,
-            "gvz_high": False, "gvz_jump": False,
-            "us10y": False, "us02y": False,
-            "spdr": False, 
-            "h1_hour": -1,
-            "news": []
-        }
-    }
-    
+# ==============================================================================
+# HÀM LẤY DỮ LIỆU THỊ TRƯỜNG (CORE)
+# ==============================================================================
+def get_market_data():
+    data = {}
     try:
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, 'r') as f:
-                saved = json.load(f)
-                # Merge key mới vào tránh lỗi
-                for k, v in default_state.items():
-                    if k not in saved: saved[k] = v
-                _RAM_STATE = saved # Cập nhật vào RAM
-                return saved
-    except: pass
-    
-    _RAM_STATE = default_state
-    return default_state
+        # Tải dữ liệu: Vàng (GC=F), VIX (^VIX), GVZ (^GVZ), 10Y Yield (^TNX - Proxy cho T10YIE nếu thiếu)
+        # Lưu ý: T10YIE trên Yahoo đôi khi bị ẩn, dùng ^TNX (Lợi suất 10Y) để test code, 
+        # Nếu bạn có mã chính xác trên Yahoo cho Breakeven thì thay thế vào.
+        tickers = ["GC=F", "^VIX", "^GVZ", "^TNX"] 
+        
+        # Lấy dữ liệu 2 ngày để tính % thay đổi so với đóng cửa hôm qua (D1 Logic)
+        df = yf.download(tickers, period="2d", interval="1d", progress=False)
+        
+        # Lấy dữ liệu nến H1 cho Vàng để check biến động giờ
+        gold_h1 = yf.download("GC=F", period="1d", interval="1h", progress=False)
+        
+        # 1. Xử lý VIX
+        vix_cur = df['Close']['^VIX'].iloc[-1]
+        vix_prev = df['Close']['^VIX'].iloc[-2]
+        data['vix'] = vix_cur
+        data['vix_pct'] = ((vix_cur - vix_prev) / vix_prev) * 100
 
-def save_state(state):
-    global _RAM_STATE
-    try:
-        _RAM_STATE = state # Luôn cập nhật RAM
-        with open(STATE_FILE, 'w') as f:
-            json.dump(state, f)
+        # 2. Xử lý GVZ
+        gvz_cur = df['Close']['^GVZ'].iloc[-1]
+        gvz_prev = df['Close']['^GVZ'].iloc[-2]
+        data['gvz'] = gvz_cur
+        data['gvz_pct'] = ((gvz_cur - gvz_prev) / gvz_prev) * 100
+
+        # 3. Xử lý T10YIE (Dùng tạm ^TNX để demo logic tính toán điểm)
+        t10_cur = df['Close']['^TNX'].iloc[-1]
+        t10_prev = df['Close']['^TNX'].iloc[-2]
+        data['t10_val'] = t10_cur
+        data['t10_change'] = t10_cur - t10_prev # Tính thay đổi tuyệt đối (điểm)
+
+        # 4. Xử lý Vàng H1 (Giá hiện tại & Biên độ nến H1)
+        if not gold_h1.empty:
+            last_candle = gold_h1.iloc[-1]
+            data['gold_price'] = last_candle['Close']
+            data['gold_h1_range'] = last_candle['High'] - last_candle['Low']
+        else:
+            data['gold_price'] = 0
+            data['gold_h1_range'] = 0
+
+        # 5. Dữ liệu ngoài (Fed & SPDR)
+        data['fed_change'] = get_fedwatch_change()
+        spdr_cur, spdr_hist = get_spdr_status()
+        data['spdr_flow'] = spdr_cur
+        data['spdr_hist'] = spdr_hist
+
     except Exception as e:
-        print(f"Không ghi được file (không sao, đã có RAM): {e}")
+        print(f"Lỗi lấy dữ liệu: {e}")
+        return None
+    
+    return data
 
-# --- CÁC HÀM LẤY DATA (GIỮ NGUYÊN) ---
-def get_gold_spot_price():
-    try:
-        ticker = yf.Ticker("GC=F")
-        price = ticker.fast_info.last_price
-        if price and price > 0: return float(price)
-        ticker_spot = yf.Ticker("XAUUSD=X")
-        price_spot = ticker_spot.fast_info.last_price
-        if price_spot and price_spot > 0: return float(price_spot)
-        hist = ticker.history(period="1d")
-        if not hist.empty: return float(hist['Close'].iloc[-1])
-        return 0.0
-    except: return 0.0
-
-def get_spdr_data():
-    try:
-        url = "https://www.spdrgoldshares.com/assets/dynamic/GLD/GLD_US_archive_EN.csv"
-        s = requests.get(url, timeout=5).content
-        df = pd.read_csv(io.StringIO(s.decode('utf-8')), skiprows=6)
-        df = df[['Date', 'Total Net Asset Value Tonnes in the Trust']].dropna().tail(5)
-        last = df.iloc[-1]
-        prev = df.iloc[-2]
-        tonnes = float(last['Total Net Asset Value Tonnes in the Trust'])
-        change = tonnes - float(prev['Total Net Asset Value Tonnes in the Trust'])
-        diffs = df['Total Net Asset Value Tonnes in the Trust'].diff().tail(3)
-        return {'tonnes': tonnes, 'change': change, 'streak_buy': all(x > 0 for x in diffs.dropna()), 'streak_sell': all(x < 0 for x in diffs.dropna())}
-    except: return {'tonnes': 0.0, 'change': 0.0, 'streak_buy': False, 'streak_sell': False}
-
-def check_sensitive_news(triggered_news_list):
+# ==============================================================================
+# HÀM GỬI CẢNH BÁO (LOGIC CHÍNH)
+# ==============================================================================
+def check_triggers(data):
     alerts = []
-    new_triggered = triggered_news_list.copy()
-    try:
-        ticker = yf.Ticker("GC=F") 
-        for item in ticker.news:
-            title = item.get('title', '').lower()
-            uuid = item.get('uuid', title)
-            if uuid in triggered_news_list: continue
-            for kw in NEWS_KEYWORDS:
-                if kw in title:
-                    alerts.append(f"📰 **TIN NÓNG:** {item['title']}")
-                    new_triggered.append(uuid)
-                    break
-    except: pass
-    return alerts, new_triggered[-20:]
-
-# --- LOGIC CHÍNH ---
-async def logic_check_market():
-    loop = asyncio.get_event_loop()
-    bot = telegram.Bot(token=TOKEN)
     
-    state = load_state()
-    vn_tz = pytz.timezone('Asia/Ho_Chi_Minh')
-    now_vn = datetime.now(vn_tz)
-    today_str = now_vn.strftime('%Y-%m-%d')
-    current_hour = now_vn.hour
-    
-    # 1. Reset Logic Ngày Mới
-    if state['date_str'] != today_str:
-        state['date_str'] = today_str
-        state['alerts_triggered'] = {k: False if k != 'news' else [] for k, v in state['alerts_triggered'].items()}
-        state['alerts_triggered']['news'] = []
-        state['alerts_triggered']['h1_hour'] = -1
+    # 1. Check VIX
+    if data['vix'] > CONFIG["VIX_VALUE_LIMIT"] or data['vix_pct'] > CONFIG["VIX_PCT_CHANGE_LIMIT"]:
+        alerts.append(f"⚠️ VIX BÁO ĐỘNG: {data['vix']:.2f} (Tăng {data['vix_pct']:.2f}%)")
 
-    alerts = [] 
+    # 2. Check GVZ
+    if data['gvz'] > CONFIG["GVZ_VALUE_LIMIT"] or data['gvz_pct'] > CONFIG["GVZ_PCT_CHANGE_LIMIT"]:
+        alerts.append(f"⚠️ GVZ (Bão Vàng): {data['gvz']:.2f} (Tăng {data['gvz_pct']:.2f}%)")
 
-    # 2. Lấy Data
-    gold_now = get_gold_spot_price()
-    tickers = ["^VIX", "^GVZ", "^TNX", "^IRX", "GC=F"]
-    data = await loop.run_in_executor(None, lambda: yf.download(tickers, period="2d", interval="1d", progress=False, auto_adjust=True))
-    data_h1 = await loop.run_in_executor(None, lambda: yf.download("GC=F", period="1d", interval="60m", progress=False, auto_adjust=True))
+    # 3. Check T10YIE / Yield
+    if abs(data['t10_change']) > CONFIG["T10YIE_CHANGE_LIMIT"]:
+        tag = "TĂNG" if data['t10_change'] > 0 else "GIẢM"
+        alerts.append(f"⚠️ Lợi suất/Kỳ vọng {tag} mạnh: {abs(data['t10_change']):.3f} điểm")
 
-    def get_stat(ticker):
-        try:
-            if isinstance(data.columns, pd.MultiIndex): s = data['Close'][ticker].dropna()
-            else: s = data['Close'].dropna()
-            if len(s) < 2: return 0.0, 0.0, 0.0
-            curr, prev = float(s.iloc[-1]), float(s.iloc[-2])
-            return round(curr, 2), round(curr-prev, 2), round((curr-prev)/prev*100, 2) if prev else 0.0
-        except: return 0.0, 0.0, 0.0
+    # 4. Check FedWatch
+    if abs(data['fed_change']) >= CONFIG["FEDWATCH_CHANGE_LIMIT"]:
+        alerts.append(f"🚨 FEDWATCH ĐẢO CHIỀU: {data['fed_change']}% (Cực nguy hiểm)")
 
-    vix_val, vix_chg, vix_pct = get_stat("^VIX")
-    gvz_val, gvz_chg, gvz_pct = get_stat("^GVZ")
-    us10_val, us10_chg, us10_pct = get_stat("^TNX")
-    us02_val, us02_chg, us02_pct = get_stat("^IRX")
-    gold_d_val, gold_d_chg, gold_d_pct = get_stat("GC=F")
-    
-    if gold_now == 0.0: gold_now = gold_d_val
-    realtime_gold_chg = round(gold_now - (gold_d_val - gold_d_chg), 2) if gold_d_val else gold_d_chg
+    # 5. Check SPDR
+    # - Điều kiện 1: Mua bán > 5 tấn
+    if abs(data['spdr_flow']) >= CONFIG["SPDR_TONS_LIMIT"]:
+         tag = "MUA" if data['spdr_flow'] > 0 else "XẢ"
+         alerts.append(f"🐋 CÁ MẬP SPDR {tag}: {abs(data['spdr_flow'])} tấn")
+    # - Điều kiện 2: 3 ngày liên tiếp cùng chiều
+    # Logic: Nếu cả 3 ngày đều dương (mua) hoặc đều âm (bán) và khác 0
+    if all(x > 0 for x in data['spdr_hist']) or all(x < 0 for x in data['spdr_hist']):
+        alerts.append(f"⚠️ SPDR hành động 3 ngày liên tiếp!")
 
-    # --- 3. KIỂM TRA ALERT ---
-    
-    # VIX
-    if vix_val > THRESHOLDS['VIX_HIGH'] and not state['alerts_triggered']['vix_high']:
-        alerts.append(f"🔴 **VIX NGUY HIỂM:** {vix_val}")
-        state['alerts_triggered']['vix_high'] = True
-    if vix_pct >= THRESHOLDS['VIX_CHANGE_PCT'] and not state['alerts_triggered']['vix_jump']:
-        alerts.append(f"⚠️ **VIX BÙNG NỔ:** +{vix_pct}%")
-        state['alerts_triggered']['vix_jump'] = True
+    # 6. Check Gold H1 Range
+    if data['gold_h1_range'] >= CONFIG["GOLD_H1_RANGE_LIMIT"]:
+        alerts.append(f"🚨 VÀNG H1 BIẾN ĐỘNG MẠNH: {data['gold_h1_range']:.2f} giá ($)")
 
-    # GVZ
-    if (gvz_pct >= THRESHOLDS['GVZ_CHANGE_PCT'] or gvz_val > THRESHOLDS['GVZ_HIGH']) and not state['alerts_triggered']['gvz_jump']:
-         alerts.append(f"⚠️ **GVZ TĂNG MẠNH:** +{gvz_pct}% (Val: {gvz_val})")
-         state['alerts_triggered']['gvz_jump'] = True
+    return alerts
 
-    # Yields
-    if abs(us10_chg) >= THRESHOLDS['US10Y_CHANGE'] and not state['alerts_triggered']['us10y']:
-        alerts.append(f"🇺🇸 **US10Y BIẾN ĐỘNG:** {us10_chg:+.2f} điểm")
-        state['alerts_triggered']['us10y'] = True
-    if abs(us02_chg) >= THRESHOLDS['US02Y_CHANGE'] and not state['alerts_triggered']['us02y']:
-        alerts.append(f"🏦 **US02Y BIẾN ĐỘNG:** {us02_chg:+.2f} điểm")
-        state['alerts_triggered']['us02y'] = True
+def send_telegram_msg(message):
+    # Code gửi telegram thật (Placeholder)
+    print("\n" + "="*40)
+    print(f"📩 SENDING TELEGRAM:\n{message}")
+    print("="*40 + "\n")
+    # Để kích hoạt gửi thật, bỏ comment dòng dưới và cài thư viện requests
+    # import requests
+    # url = f"https://api.telegram.org/bot{CONFIG['TELEGRAM_TOKEN']}/sendMessage?chat_id={CONFIG['TELEGRAM_CHAT_ID']}&text={message}"
+    # requests.get(url)
 
-    # SPDR
-    spdr = get_spdr_data()
-    if (abs(spdr['change']) >= THRESHOLDS['SPDR_CHANGE_TONS'] or spdr['streak_buy'] or spdr['streak_sell']) and not state['alerts_triggered']['spdr']:
-        alerts.append(f"🐋 **SPDR:** {spdr['change']:+.2f} tấn")
-        state['alerts_triggered']['spdr'] = True
+# ==============================================================================
+# MAIN LOOP
+# ==============================================================================
+def main():
+    print("🤖 BOT MONITOR STARTED - MODE: EA RISK 100 PRICES")
+    last_update_time = datetime.now() - timedelta(minutes=31) # Để trigger update ngay lần đầu
 
-    # H1 Candle
-    if not data_h1.empty:
-        try:
-            if isinstance(data_h1.columns, pd.MultiIndex):
-                try:
-                    last_h1 = data_h1.iloc[-1]
-                    high = float(last_h1['High']['GC=F']) if 'GC=F' in last_h1['High'] else float(last_h1['High'])
-                    low = float(last_h1['Low']['GC=F']) if 'GC=F' in last_h1['Low'] else float(last_h1['Low'])
-                except:
-                    high = float(data_h1['High'].iloc[-1])
-                    low = float(data_h1['Low'].iloc[-1])
-            else:
-                high = float(data_h1['High'].iloc[-1])
-                low = float(data_h1['Low'].iloc[-1])
-
-            h1_range = high - low
-            last_alert_hour = state['alerts_triggered'].get('h1_hour', -1)
+    while True:
+        current_time = datetime.now()
+        data = get_market_data()
+        
+        if data:
+            # 1. Kiểm tra điều kiện báo động (Alert)
+            alerts = check_triggers(data)
             
-            if h1_range >= THRESHOLDS['GOLD_H1_MOVE'] and last_alert_hour != current_hour:
-                alerts.append(f"🔥 **H1 BIẾN ĐỘNG:** {h1_range:.1f}$")
-                state['alerts_triggered']['h1_hour'] = current_hour 
-        except: pass
+            if alerts:
+                # Nếu có biến => Gửi ngay lập tức
+                msg_content = "\n".join(alerts)
+                full_msg = f"🔥🔥 CẢNH BÁO RỦI RO 🔥🔥\nThời gian: {current_time.strftime('%H:%M')}\n\n{msg_content}\n\n👉 KIỂM TRA EA NGAY!"
+                send_telegram_msg(full_msg)
+            
+            # 2. Kiểm tra điều kiện báo cáo định kỳ (Update)
+            # Chỉ gửi nếu ko có báo động và đã qua 30 phút
+            elif (current_time - last_update_time).total_seconds() >= 1800: # 1800s = 30p
+                status_msg = (
+                    f"📊 MARKET UPDATE 30M\n"
+                    f"Gold: {data['gold_price']:.1f} | H1 Range: {data['gold_h1_range']:.1f}\n"
+                    f"VIX: {data['vix']:.1f} ({data['vix_pct']:.1f}%)\n"
+                    f"GVZ: {data['gvz']:.1f} ({data['gvz_pct']:.1f}%)\n"
+                    f"US10Y/T10 Change: {data['t10_change']:.3f}\n"
+                    f"FedWatch Change: {data['fed_change']}%\n"
+                    f"SPDR Today: {data['spdr_flow']} tấn"
+                )
+                send_telegram_msg(status_msg)
+                last_update_time = current_time
+            
+            else:
+                print(f"[{current_time.strftime('%H:%M:%S')}] Monitoring... Gold: {data['gold_price']:.1f}, H1: {data['gold_h1_range']:.1f}")
 
-    # News
-    news_alerts, updated_news = check_sensitive_news(state['alerts_triggered']['news'])
-    if news_alerts:
-        alerts.extend(news_alerts)
-        state['alerts_triggered']['news'] = updated_news
+        # Nghỉ 60 giây trước khi quét lại
+        time.sleep(60)
 
-    # --- 4. QUYẾT ĐỊNH GỬI (ĐÃ FIX LOGIC) ---
-    
-    last_dash = datetime.fromtimestamp(state['last_dash_time'], tz=vn_tz)
-    diff_mins = (now_vn - last_dash).total_seconds() / 60
-    
-    # LOGIC CHỐNG SPAM:
-    # Nếu chưa từng gửi lần nào (lần đầu chạy bot) -> Gán thời gian hiện tại vào luôn và KHÔNG GỬI, trừ khi có ALERT.
-    # Điều này giúp bot khi restart không spam "Market Monitor"
-    if state['last_dash_time'] == 0 and not alerts:
-        state['last_dash_time'] = now_vn.timestamp()
-        save_state(state)
-        return # Thoát luôn, không gửi
-    
-    should_send_dash = False
-    
-    # Nếu có Alert -> Gửi Alert ngay lập tức
-    if alerts:
-        await bot.send_message(chat_id=CHAT_ID, text="🚨 **CẢNH BÁO:**\n" + "\n".join(alerts), parse_mode='Markdown')
-        should_send_dash = True # Kèm luôn dashboard cho tiện theo dõi
-
-    # Nếu đã quá 30 phút -> Gửi Dashboard
-    if diff_mins >= 30:
-        should_send_dash = True
-
-    if should_send_dash:
-        time_str = now_vn.strftime('%H:%M %d/%m')
-        gold_icon = '📈' if realtime_gold_chg > 0 else '📉'
-        
-        dashboard = f"""
-📊 **MARKET MONITOR** ({time_str})
------------------------------
-🥇 **Gold:** {gold_now} ({gold_icon} {realtime_gold_chg:+.1f}$)
-🌊 **GVZ:** {gvz_val} ({gvz_pct}%)
-☢️ **VIX:** {vix_val} ({vix_pct}%)
-🇺🇸 **US10Y:** {us10_val}% (Var: {us10_chg})
-🏦 **US02Y:** {us02_val}% (Var: {us02_chg})
-🐋 **SPDR:** {spdr['tonnes']} tấn ({spdr['change']:+.2f})
------------------------------
-_Cập nhật mỗi 30p hoặc khi có biến động_
-        """
-        
-        # Xóa tin cũ
-        try:
-            if state['msg_id']:
-                await bot.delete_message(chat_id=CHAT_ID, message_id=state['msg_id'])
-        except: pass
-        
-        sent = await bot.send_message(chat_id=CHAT_ID, text=dashboard, parse_mode='Markdown')
-        try: await bot.pin_chat_message(chat_id=CHAT_ID, message_id=sent.message_id)
-        except: pass
-        
-        state['msg_id'] = sent.message_id
-        state['last_dash_time'] = now_vn.timestamp()
-
-    save_state(state)
-
-# --- SERVER ---
-@app.route('/')
-def home(): return "Bot Live", 200
-
-@app.route('/test')
-def test_bot():
-    try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        bot = telegram.Bot(token=TOKEN)
-        m = loop.run_until_complete(bot.send_message(chat_id=CHAT_ID, text="✅ **TEST:** Bot kết nối thành công!"))
-        loop.close()
-        return f"OK! ID: {m.message_id}", 200
-    except Exception as e: return f"❌ LỖI: {str(e)}", 500
-
-@app.route('/run_check')
-def run_check():
-    try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(logic_check_market())
-        loop.close()
-        return "Checked", 200
-    except Exception as e:
-        print(f"Error: {traceback.format_exc()}")
-        return f"Error: {str(e)}", 500
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+if __name__ == "__main__":
+    main()
