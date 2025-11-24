@@ -4,237 +4,283 @@ import yfinance as yf
 import pandas as pd
 import requests
 import io
-import time
+import json
+import os
 from flask import Flask
 from datetime import datetime, timedelta
 import pytz
 
-# --- CẤU HÌNH (ĐIỀN LẠI THÔNG TIN CỦA BẠN VÀO ĐÂY) ---
-TOKEN = '8309991075:AAFYyjFxQQ8CYECXPKeteeUBXQE3Mx2yfUo'  # <-- NHỚ ĐIỀN LẠI TOKEN CỦA BẠN
-CHAT_ID = '5464507208'                    # <-- NHỚ ĐIỀN LẠI CHAT ID CỦA BẠN
+# --- CẤU HÌNH (ĐIỀN LẠI THÔNG TIN CỦA BẠN) ---
+TOKEN = '8309991075:AAFYyjFxQQ8CYECXPKeteeUBXQE3Mx2yfUo' 
+CHAT_ID = '5464507208'                    
 
 app = Flask(__name__)
 
 # --- CẤU HÌNH NGƯỠNG CẢNH BÁO ---
 THRESHOLDS = {
-    'VIX_DANGER': 30,           
-    'VIX_CHANGE_PCT': 10.0,     # Chỉ báo khi VIX TĂNG >= 10%
-    'GVZ_DANGER': 25,           
-    'GVZ_CHANGE_PCT': 15.0,     # GVZ Tăng >= 15%
-    'US10Y_CHANGE': 0.25,       
-    'US02Y_CHANGE': 0.2,        # US02Y biến động 0.2 điểm
-    'GOLD_MOVE_DOLLARS': 50.0,  # Vàng chạy 50$ (500 pips)
-    'GOLD_H1_MOVE_DOLLARS': 40.0, # Vàng nến H1 > 40$ (400 pips)
-    'SPDR_CHANGE_TONS': 5.0,    
+    'VIX_HIGH': 30,             # VIX trên 30
+    'VIX_CHANGE_PCT': 15.0,     # VIX tăng 15% trong ngày
+    'GVZ_HIGH': 25,             # GVZ trên 25
+    'GVZ_CHANGE_PCT': 10.0,     # GVZ tăng 10% trong ngày
+    'US10Y_CHANGE': 0.25,       # Yield 10Y biến động 0.25 điểm
+    'US02Y_CHANGE': 0.20,       # Yield 02Y biến động 0.20 điểm
+    'SPDR_CHANGE_TONS': 5.0,    # SPDR mua/bán 5 tấn
+    'GOLD_H1_MOVE': 40.0,       # Nến H1 chạy 40 giá (400 pips)
 }
 
-# File tạm để lưu trạng thái
-MSG_ID_FILE = "msg_id.txt"
-LAST_DASHBOARD_TIME_FILE = "last_dash_time.txt"
+# Từ khóa tin tức nhạy cảm (Cảnh báo biến động mạnh)
+NEWS_KEYWORDS = ["war", "nuclear", "attack", "cpi", "nfp", "fed rate", "powell", "inflation", "escalation"]
 
-# --- HÀM HỖ TRỢ LẤY GIÁ VÀNG SPOT (MỚI) ---
-def get_gold_spot_price():
-    """Lấy giá Vàng Spot (XAUUSD) từ nguồn bên ngoài để đảm bảo độ chính xác"""
+# Tên file lưu trạng thái
+STATE_FILE = "bot_state.json"
+
+# --- QUẢN LÝ TRẠNG THÁI (TRÁNH SPAM) ---
+def load_state():
     try:
-        # Sử dụng API của Yahoo Finance cho XAUUSD=X (Spot Gold)
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, 'r') as f:
+                return json.load(f)
+    except: pass
+    return {
+        "msg_id": None,
+        "last_dash_time": 0,
+        "date_str": "",
+        "alerts_triggered": {
+            "vix_high": False, "vix_jump": False,
+            "gvz_high": False, "gvz_jump": False,
+            "us10y": False, "us02y": False,
+            "spdr": False, "news": [] # Lưu các tin đã báo để ko báo lại
+        }
+    }
+
+def save_state(state):
+    try:
+        with open(STATE_FILE, 'w') as f:
+            json.dump(state, f)
+    except Exception as e:
+        print(f"Lỗi lưu state: {e}")
+
+# --- HÀM HỖ TRỢ LẤY DATA ---
+def get_gold_spot_price():
+    try:
         url = "https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X?region=US&lang=en-US&interval=1m&range=1h"
         headers = {'User-Agent': 'Mozilla/5.0'}
         response = requests.get(url, headers=headers, timeout=5)
-        response.raise_for_status() # Báo lỗi nếu status code không phải 200
-        
         data = response.json()
-        
-        if 'result' in data['chart'] and data['chart']['result']:
-            price_list = data['chart']['result'][0]['indicators']['quote'][0]['close']
-            if price_list and price_list[-1] is not None:
-                return round(price_list[-1], 2)
-        return 0.0
-    except Exception as e:
-        print(f"Lỗi khi lấy giá Gold Spot từ API: {e}")
-        return 0.0
+        result = data['chart']['result'][0]['indicators']['quote'][0]['close']
+        price = next((x for x in reversed(result) if x is not None), 0)
+        return round(price, 2)
+    except: return 0.0
 
-# --- HÀM HỖ TRỢ THỜI GIAN ---
-def get_last_dash_time():
-    """Lấy thời điểm gửi dashboard lần cuối (dùng cho logic 30 phút)"""
-    try:
-        with open(LAST_DASHBOARD_TIME_FILE, "r") as f:
-            timestamp = float(f.read().strip())
-            return datetime.fromtimestamp(timestamp, tz=pytz.utc)
-    except:
-        return datetime.min.replace(tzinfo=pytz.utc)
-
-def save_last_dash_time(dt_obj):
-    """Lưu thời điểm gửi dashboard mới nhất"""
-    with open(LAST_DASHBOARD_TIME_FILE, "w") as f:
-        f.write(str(dt_obj.timestamp()))
-
-# --- HÀM LẤY DỮ LIỆU ---
 def get_spdr_data():
-    """Đọc dữ liệu trực tiếp từ file CSV của quỹ SPDR"""
     try:
         url = "https://www.spdrgoldshares.com/assets/dynamic/GLD/GLD_US_archive_EN.csv"
         s = requests.get(url, timeout=5).content
         df = pd.read_csv(io.StringIO(s.decode('utf-8')), skiprows=6)
         df = df[['Date', 'Total Net Asset Value Tonnes in the Trust']].dropna().tail(5)
         
-        last_row = df.iloc[-1]
-        prev_row = df.iloc[-2]
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+        tonnes = float(last['Total Net Asset Value Tonnes in the Trust'])
+        change = tonnes - float(prev['Total Net Asset Value Tonnes in the Trust'])
         
-        tonnes_now = float(last_row['Total Net Asset Value Tonnes in the Trust'])
-        change = tonnes_now - float(prev_row['Total Net Asset Value Tonnes in the Trust'])
+        # Check streak (3 ngày cùng chiều)
+        diffs = df['Total Net Asset Value Tonnes in the Trust'].diff().tail(3)
+        is_buy_streak = all(x > 0 for x in diffs.dropna())
+        is_sell_streak = all(x < 0 for x in diffs.dropna())
         
-        diffs = df['Total Net Asset Value Tonnes in the Trust'].diff().tail(3).apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))
-        streak_buy = all(diffs == 1)
-        streak_sell = all(diffs == -1)
-        
-        return {'tonnes': tonnes_now, 'change': change, 'streak_buy': streak_buy, 'streak_sell': streak_sell}
-    except Exception as e:
-        print(f"Lỗi SPDR: {e}")
+        return {'tonnes': tonnes, 'change': change, 'streak_buy': is_buy_streak, 'streak_sell': is_sell_streak}
+    except:
         return {'tonnes': 0, 'change': 0, 'streak_buy': False, 'streak_sell': False}
 
+def check_sensitive_news(triggered_news_list):
+    """Kiểm tra tin tức từ Yahoo Finance xem có tin sốc không"""
+    alerts = []
+    new_triggered = triggered_news_list.copy()
+    try:
+        ticker = yf.Ticker("GC=F")
+        news = ticker.news
+        for item in news:
+            title = item.get('title', '').lower()
+            link = item.get('link', '')
+            uuid = item.get('uuid', title) # Dùng title làm ID nếu ko có uuid
+            
+            if uuid in triggered_triggered: continue # Tin này đã báo rồi
+
+            for kw in NEWS_KEYWORDS:
+                if kw in title:
+                    alerts.append(f"📰 **TIN NÓNG:** {item['title']} \n(Nguy cơ biến động mạnh!)")
+                    new_triggered.append(uuid)
+                    break
+    except: pass
+    return alerts, new_triggered[-20:] # Chỉ giữ lại 20 tin gần nhất để tiết kiệm bộ nhớ
+
+# --- LOGIC CHÍNH ---
 async def logic_check_market():
-    # SỬ DỤNG asyncio.get_event_loop() ĐỂ TRÁNH LỖI 'RuntimeError: Event loop is closed'
     loop = asyncio.get_event_loop()
     bot = telegram.Bot(token=TOKEN)
-    alerts = [] 
-    now_utc = datetime.now(pytz.utc)
+    
+    # 1. Load State & Reset flags nếu sang ngày mới
+    state = load_state()
+    vn_tz = pytz.timezone('Asia/Ho_Chi_Minh')
+    now_vn = datetime.now(vn_tz)
+    today_str = now_vn.strftime('%Y-%m-%d')
+    
+    if state['date_str'] != today_str:
+        # Reset flags cho ngày mới
+        state['date_str'] = today_str
+        state['alerts_triggered'] = {k: False if k != 'news' else [] for k, v in state['alerts_triggered'].items()}
+        state['alerts_triggered']['news'] = []
 
+    alerts = []
+    
     try:
-        # 1. Lấy dữ liệu Vàng mới nhất (Spot) VÀ VIX, GVZ, Yields (Daily)
+        # 2. Lấy dữ liệu
+        gold_now = get_gold_spot_price()
         
-        # --- FIX LỖI GIÁ VÀNG $0 ---
-        gold_price_latest = get_gold_spot_price() 
+        # Lấy data Daily cho VIX, Yields
+        tickers = ["^VIX", "^GVZ", "^TNX", "^IRX", "GC=F"]
+        data = await loop.run_in_executor(None, lambda: yf.download(tickers, period="2d", interval="1d", progress=False))
         
-        tickers_daily = ["GC=F", "^GVZ", "^VIX", "^TNX", "^IRX"] 
-        data_daily = await loop.run_in_executor(None, lambda: yf.download(tickers_daily, period="2d", interval="1d", progress=False))
-        
-        # H1 Gold data
-        gold_data_h1 = await loop.run_in_executor(None, lambda: yf.download("GC=F", period="2d", interval="60m", progress=False))
-        
-        # Lấy giá trị hiện tại (Latest) và Đóng cửa hôm qua (Prev)
-        def get_val(ticker, data):
+        # Lấy data H1 cho Gold để check nến
+        data_h1 = await loop.run_in_executor(None, lambda: yf.download("GC=F", period="1d", interval="60m", progress=False))
+
+        def get_stat(ticker):
             try:
-                closes = data['Close'][ticker].dropna()
-                if len(closes) < 2: return 0, 0, 0
-                curr = closes.iloc[-1]
-                prev = closes.iloc[-2]
+                s = data['Close'][ticker].dropna()
+                if len(s) < 2: return 0, 0, 0
+                curr, prev = s.iloc[-1], s.iloc[-2]
                 chg = curr - prev
-                pct = (chg / prev) * 100 if prev != 0 else 0
+                pct = (chg/prev)*100 if prev else 0
                 return round(curr, 2), round(chg, 2), round(pct, 2)
             except: return 0, 0, 0
 
-        # --- TÍNH TOÁN CÁC CHỈ SỐ ---
+        vix_val, vix_chg, vix_pct = get_stat("^VIX")
+        gvz_val, gvz_chg, gvz_pct = get_stat("^GVZ")
+        us10_val, us10_chg, us10_pct = get_stat("^TNX")
+        us02_val, us02_chg, us02_pct = get_stat("^IRX")
+        gold_d_val, gold_d_chg, gold_d_pct = get_stat("GC=F")
+
+        if gold_now == 0: gold_now = gold_d_val # Fallback
+
+        # --- KIỂM TRA ĐIỀU KIỆN CẢNH BÁO (ALERTS) ---
         
-        # Giá đóng cửa Gold hôm qua và thay đổi (dùng GC=F daily)
-        gold_close, gold_chg, gold_pct = get_val("GC=F", data_daily) 
-        
-        # SỬ DỤNG GIÁ TỨC THỜI MỚI (gold_price_latest) cho Dashboard
-        gold_price = gold_price_latest if gold_price_latest != 0.0 else gold_close
+        # 1. VIX
+        if vix_val > THRESHOLDS['VIX_HIGH'] and not state['alerts_triggered']['vix_high']:
+            alerts.append(f"🔴 **VIX NGUY HIỂM:** Đã vượt mức {THRESHOLDS['VIX_HIGH']} (Hiện tại: {vix_val})")
+            state['alerts_triggered']['vix_high'] = True
+            
+        if vix_pct >= THRESHOLDS['VIX_CHANGE_PCT'] and not state['alerts_triggered']['vix_jump']:
+            alerts.append(f"⚠️ **VIX BÙNG NỔ:** Tăng +{vix_pct}% trong ngày")
+            state['alerts_triggered']['vix_jump'] = True
 
-        # 2. Các chỉ số khác
-        gvz_val, gvz_chg, gvz_pct = get_val("^GVZ", data_daily)
-        vix_val, vix_chg, vix_pct = get_val("^VIX", data_daily)
-        us10y_val, us10y_chg, us10y_pct = get_val("^TNX", data_daily)
-        us02y_val, us02y_chg, us02y_pct = get_val("^IRX", data_daily)
+        # 2. GVZ (Gold Volatility)
+        if gvz_val > THRESHOLDS['GVZ_HIGH'] and not state['alerts_triggered']['gvz_high']:
+            alerts.append(f"🌪 **BÃO VÀNG:** GVZ vượt {THRESHOLDS['GVZ_HIGH']} (Biến động cực mạnh)")
+            state['alerts_triggered']['gvz_high'] = True
+            
+        if (gvz_pct >= THRESHOLDS['GVZ_CHANGE_PCT'] or gvz_val > 25) and not state['alerts_triggered']['gvz_jump']:
+             # Logic gộp: Tăng 10% hoặc > 25 đều báo khẩn 1 lần
+             if gvz_pct >= THRESHOLDS['GVZ_CHANGE_PCT']:
+                 alerts.append(f"⚠️ **GVZ TĂNG SỐC:** +{gvz_pct}%")
+             state['alerts_triggered']['gvz_jump'] = True
 
-        # --- LOGIC CẢNH BÁO (RUNG CHUÔNG) ---
-        
-        # 1. VIX 
-        if vix_val >= THRESHOLDS['VIX_DANGER']:
-            alerts.append(f"🔴 **NGUY HIỂM:** VIX đạt {vix_val} (Rủi ro cao)")
-        if vix_pct >= THRESHOLDS['VIX_CHANGE_PCT']: 
-            alerts.append(f"⚠️ **VIX BÙNG NỔ:** Tăng +{vix_pct}%")
+        # 3. Yields (US10Y, US02Y)
+        if abs(us10_chg) >= THRESHOLDS['US10Y_CHANGE'] and not state['alerts_triggered']['us10y']:
+            trend = "TĂNG" if us10_chg > 0 else "GIẢM"
+            alerts.append(f"🇺🇸 **US10Y {trend} MẠNH:** {abs(us10_chg)} điểm (Nến D1)")
+            state['alerts_triggered']['us10y'] = True
 
-        # 2. GVZ 
-        if gvz_val >= THRESHOLDS['GVZ_DANGER']:
-            alerts.append(f"🌪 **BÃO VÀNG:** GVZ đạt {gvz_val}")
-        if gvz_pct >= THRESHOLDS['GVZ_CHANGE_PCT']: 
-            alerts.append(f"⚠️ **GVZ TĂNG MẠNH:** +{gvz_pct}% (Đạt 15%)")
+        if abs(us02_chg) >= THRESHOLDS['US02Y_CHANGE'] and not state['alerts_triggered']['us02y']:
+            trend = "TĂNG" if us02_chg > 0 else "GIẢM"
+            alerts.append(f"🏦 **US02Y {trend} MẠNH:** {abs(us02_chg)} điểm (Kỳ vọng lãi suất thay đổi)")
+            state['alerts_triggered']['us02y'] = True
 
-        # 3. US10Y
-        if abs(us10y_chg) >= THRESHOLDS['US10Y_CHANGE']:
-            trend = "TĂNG" if us10y_chg > 0 else "GIẢM"
-            alerts.append(f"🇺🇸 **US10Y:** {trend} {abs(us10y_chg)} điểm")
-
-        # 4. US02Y 
-        if abs(us02y_chg) >= THRESHOLDS['US02Y_CHANGE']:
-            trend = "TĂNG" if us02y_chg > 0 else "GIẢM"
-            alerts.append(f"🏦 **LÃI SUẤT US02Y:** {trend} {abs(us02y_chg)} điểm")
-
-        # 5. SPDR GOLD TRUST
+        # 4. SPDR (Cá mập)
         spdr = get_spdr_data()
-        if abs(spdr['change']) >= THRESHOLDS['SPDR_CHANGE_TONS']:
-            action = "MUA GOM" if spdr['change'] > 0 else "XẢ HÀNG"
-            alerts.append(f"🐋 **SPDR {action}:** {abs(round(spdr['change'], 2))} tấn")
-        if spdr['streak_buy']: alerts.append("🐋 **SPDR:** Mua ròng 3 ngày liên tiếp")
-        if spdr['streak_sell']: alerts.append("🐋 **SPDR:** Xả ròng 3 ngày liên tiếp")
-
-        # 6. GOLD PRICE DAY CHANGE (500 pips)
-        if abs(gold_chg) >= THRESHOLDS['GOLD_MOVE_DOLLARS']:
-            pips = int(abs(gold_chg) * 10) 
-            alerts.append(f"💰 **VÀNG BIẾN ĐỘNG:** {gold_chg}$ (~{pips} pips)")
-
-        # 7. GOLD H1 CANDLE (400 pips)
-        if not gold_data_h1.empty and len(gold_data_h1) >= 2:
-            last_candle = gold_data_h1.iloc[-2] # Nến H1 hoàn thành gần nhất
-            h1_range = round(last_candle['High'] - last_candle['Low'], 2)
-            if h1_range >= THRESHOLDS['GOLD_H1_MOVE_DOLLARS']:
-                pips_h1 = int(h1_range * 10)
-                alerts.append(f"🔥 **H1 NẾN VÀNG:** {h1_range}$ ({pips_h1} pips). Tín hiệu hành động mạnh!")
+        # Chỉ báo nếu có thay đổi mới so với lần check trước (hoặc dùng logic flag đơn giản trong ngày)
+        # Ở đây dùng flag trong ngày: nếu hôm nay đã báo rồi thì thôi, trừ khi số lượng thay đổi
+        if (abs(spdr['change']) >= THRESHOLDS['SPDR_CHANGE_TONS'] or spdr['streak_buy'] or spdr['streak_sell']) and not state['alerts_triggered']['spdr']:
+            if abs(spdr['change']) >= THRESHOLDS['SPDR_CHANGE_TONS']:
+                action = "MUA GOM" if spdr['change'] > 0 else "XẢ HÀNG"
+                alerts.append(f"🐋 **SPDR {action}:** {abs(spdr['change'])} tấn")
             
-        # 3. GỬI CẢNH BÁO TỨC THỜI (REALTIME)
+            if spdr['streak_buy']: alerts.append("🐋 **SPDR:** Mua ròng 3 ngày liên tiếp!")
+            if spdr['streak_sell']: alerts.append("🐋 **SPDR:** Bán ròng 3 ngày liên tiếp!")
+            
+            state['alerts_triggered']['spdr'] = True
+
+        # 5. Gold H1 Candle (Realtime - Luôn cảnh báo nếu mới xảy ra)
+        if not data_h1.empty:
+            last_h1 = data_h1.iloc[-1]
+            # Kiểm tra nến hiện tại (đang chạy) và nến trước đó
+            h1_range = last_h1['High'] - last_h1['Low']
+            if h1_range >= THRESHOLDS['GOLD_H1_MOVE']:
+                # Lưu ý: check nến H1 cần thận trọng kẻo spam mỗi phút. 
+                # Ta chỉ báo vào phút đóng nến hoặc chấp nhận báo lặp lại trong 1 tiếng đó nhưng có kèm thời gian
+                # Ở đây mình chọn cách báo kèm thời gian check, user tự lọc
+                alerts.append(f"🔥 **H1 BIẾN ĐỘNG:** Nến hiện tại chạy {h1_range:.1f}$ ({int(h1_range*10)} pips)")
+
+        # 6. Tin tức & FedWatch (Thay thế bằng News Sentiment)
+        # Logic: Check tin tức, nếu có từ khóa thì báo
+        # Phần FedWatch > 15% rất khó lấy chính xác nếu ko có API, nên dùng tin tức để cover.
+        news_alerts, updated_news_list = check_sensitive_news(state['alerts_triggered'].get('news', []))
+        if news_alerts:
+            alerts.extend(news_alerts)
+            state['alerts_triggered']['news'] = updated_news_list
+
+        # --- GỬI CẢNH BÁO NGAY LẬP TỨC ---
         if alerts:
-            msg_alert = "\n".join(alerts)
-            await bot.send_message(chat_id=CHAT_ID, text=msg_alert, parse_mode='Markdown')
+            msg_text = "🚨 **CẢNH BÁO KHẨN CẤP** 🚨\n\n" + "\n".join(alerts)
+            await bot.send_message(chat_id=CHAT_ID, text=msg_text, parse_mode='Markdown')
 
-
-        # --- CẬP NHẬT DASHBOARD (LOGIC 30 PHÚT) ---
+        # --- DASHBOARD ĐỊNH KỲ (30 PHÚT/LẦN HOẶC KHI CÓ ALERT) ---
+        last_dash = datetime.fromtimestamp(state['last_dash_time'], tz=vn_tz)
+        diff_mins = (now_vn - last_dash).total_seconds() / 60
         
-        last_dash_time = get_last_dash_time()
-        needs_dash_update = (now_utc - last_dash_time).total_seconds() >= 1800 # 30 phút = 1800 giây
-
-        if alerts or needs_dash_update:
+        # Chỉ gửi Dashboard nếu có Alerts hoặc đã quá 30 phút
+        if alerts or diff_mins >= 30:
+            time_str = now_vn.strftime('%H:%M %d/%m')
+            gold_icon = '📈' if gold_d_chg > 0 else '📉'
+            vix_icon = '🟢' if vix_pct < 0 else ('🔴' if vix_val > 30 else '🟡')
             
-            vn_tz = pytz.timezone('Asia/Ho_Chi_Minh')
-            time_str = datetime.now(vn_tz).strftime('%H:%M %d/%m')
-            
-            # Icon trạng thái
-            vix_icon = '🟢' if vix_pct < 0 else ('🔴' if vix_pct > 5 else '🟡')
-            gold_icon = '📈' if gold_chg > 0 else '📉'
-            
-            dashboard_msg = f"""
+            dashboard = f"""
 📊 **MARKET MONITOR** ({time_str})
 -----------------------------
-🥇 **Gold:** {gold_price} ({gold_icon} {gold_chg}$)
+🥇 **Gold:** {gold_now} ({gold_icon} {gold_d_chg}$)
 🌊 **GVZ:** {gvz_val} ({gvz_pct}%)
 {vix_icon} **VIX:** {vix_val} ({vix_pct}%)
-🇺🇸 **US10Y:** {us10y_val}% (Var: {us10y_chg})
-🏦 **US02Y:** {us02y_val}% (Var: {us02y_chg})
+🇺🇸 **US10Y:** {us10_val}% (Var: {us10_chg})
+🏦 **US02Y:** {us02_val}% (Var: {us02_chg})
 🐋 **SPDR:** {spdr['tonnes']} tấn ({spdr['change']:+.2f})
 -----------------------------
-_Cảnh báo chỉ rung chuông khi có biến động lớn_
+_Cập nhật mỗi 30p hoặc khi có biến động mạnh_
             """
             
-            # Cơ chế update tin nhắn cũ để không spam
+            # Logic xóa/sửa tin nhắn cũ
             try:
-                with open(MSG_ID_FILE, "r") as f:
-                    saved_id = int(f.read().strip())
-                await bot.edit_message_text(chat_id=CHAT_ID, message_id=saved_id, text=dashboard_msg, parse_mode='Markdown')
-            except:
-                m = await bot.send_message(chat_id=CHAT_ID, text=dashboard_msg, parse_mode='Markdown')
-                with open(MSG_ID_FILE, "w") as f:
-                    f.write(str(m.message_id))
-                try: await bot.pin_chat_message(chat_id=CHAT_ID, message_id=m.message_id)
-                except: pass
-                
-            save_last_dash_time(now_utc) # Lưu lại thời điểm update cuối
+                if state['msg_id']:
+                    await bot.delete_message(chat_id=CHAT_ID, message_id=state['msg_id'])
+            except: pass # Bỏ qua nếu ko xóa được (do tin quá cũ hoặc đã bị xóa)
+            
+            # Gửi tin mới và Pin
+            sent_msg = await bot.send_message(chat_id=CHAT_ID, text=dashboard, parse_mode='Markdown')
+            try: await bot.pin_chat_message(chat_id=CHAT_ID, message_id=sent_msg.message_id)
+            except: pass
+            
+            # Cập nhật State
+            state['msg_id'] = sent_msg.message_id
+            state['last_dash_time'] = now_vn.timestamp()
+
+        # Lưu lại state cuối cùng
+        save_state(state)
 
     except Exception as e:
-        print(f"Lỗi hệ thống: {e}")
+        print(f"Error: {e}")
 
 # --- SERVER ---
 @app.route('/')
-def home(): return "Bot OK", 200
+def home(): return "Bot Active", 200
 
 @app.route('/run_check')
 def run_check():
