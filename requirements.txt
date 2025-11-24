@@ -4,3 +4,5 @@ yfinance
 requests
 beautifulsoup4
 gunicorn
+pandas
+lxml
