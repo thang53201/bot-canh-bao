@@ -1,6 +1,6 @@
 from flask import Flask
 import yfinance as yf
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 import requests
 import pandas as pd
@@ -8,39 +8,44 @@ import pandas as pd
 app = Flask(__name__)
 
 # ==============================================================================
-# 1. CẤU HÌNH (CONFIG)
+# 1. CẤU HÌNH (CONFIG) - ĐÃ CẬP NHẬT ID & KEY MỚI
 # ==============================================================================
 CONFIG = {
-    "TELEGRAM_TOKEN": "8309991075:AAFYyjFxQQ8CYECXPKeteeUBXQE3Mx2yfUo",  # <-- ĐIỀN LẠI TOKEN
-    "TELEGRAM_CHAT_ID": "5464507208",               # <-- ĐIỀN LẠI CHAT ID
+    "TELEGRAM_TOKEN": "8309991075:AAFYyjFxQQ8CYECXPKeteeUBXQE3Mx2yfUo",
+    "TELEGRAM_CHAT_ID": "5464507208",
     
-    # NGƯỠNG CẢNH BÁO KHẨN (Emergency)
-    "VIX_LIMIT": 30,
-    "GVZ_LIMIT": 25,
-    "GOLD_H1_LIMIT": 40.0,
-    "YIELD_CHANGE_LIMIT": 3.0,   # Yield biến động > 3% (tương đối)
+    # NGƯỠNG CẢNH BÁO KHẨN CẤP
+    "VIX_LIMIT": 30,             # VIX > 30
+    "GVZ_LIMIT": 25,             # GVZ > 25
+    "GOLD_H1_LIMIT": 40.0,       # H1 Vàng > 40 giá
+    "BE_CHANGE_LIMIT": 0.25,     # Lạm phát đổi > 0.25 điểm
     
-    "ALERT_COOLDOWN": 3600
+    "ALERT_COOLDOWN": 3600       # Im lặng 60 phút sau khi báo
 }
 
 last_alert_times = {}
 
 # ==============================================================================
-# 2. HÀM LẤY DỮ LIỆU (REALTIME SPOT & YIELD)
+# 2. HÀM LẤY DỮ LIỆU THÔNG MINH (SMART FETCH)
 # ==============================================================================
-def get_realtime_data(ticker_symbol):
-    """Lấy dữ liệu Realtime D1"""
+def get_safe_d1_data(ticker_symbol):
+    """
+    Tự động quét lùi 1 tháng để tìm ngày có dữ liệu gần nhất.
+    Khắc phục triệt để lỗi Yahoo trả về 0.00 hoặc NaN cho mã Breakeven.
+    """
     try:
-        # Lấy dữ liệu 5 ngày gần nhất
         ticker = yf.Ticker(ticker_symbol)
-        hist = ticker.history(period="5d")
+        # Lấy lịch sử 1 tháng để chắc chắn có data
+        hist = ticker.history(period="1mo")
+        
+        # Xóa các hàng bị rỗng (NaN)
+        hist = hist.dropna(subset=['Close'])
         
         if len(hist) < 2:
             return 0.0, 0.0, 0.0
             
-        # Current là giá đóng cửa nến gần nhất (hoặc giá hiện tại nếu đang chạy)
+        # Lấy giá trị mới nhất (Current) và liền trước (Prev)
         current = float(hist['Close'].iloc[-1])
-        # Prev là giá đóng cửa ngày hôm trước
         prev = float(hist['Close'].iloc[-2])
         
         change_val = current - prev
@@ -51,9 +56,9 @@ def get_realtime_data(ticker_symbol):
         return 0.0, 0.0, 0.0
 
 def get_gold_h1_range():
-    """Biên độ H1 Vàng Spot"""
+    """Biên độ H1 của Gold Futures"""
     try:
-        data = yf.download("XAUUSD=X", period="1d", interval="1h", progress=False)
+        data = yf.download("GC=F", period="1d", interval="1h", progress=False)
         if not data.empty:
             try:
                 high = float(data['High'].iloc[-1].item())
@@ -69,36 +74,38 @@ def get_gold_h1_range():
 def get_market_data():
     data = {}
     
-    # 1. GOLD SPOT (XAUUSD=X) - Chuẩn Exness/Investing
-    cur, chg, pct = get_realtime_data("XAUUSD=X")
+    # 1. GOLD FUTURES (GC=F) - Giữ nguyên theo ý bạn
+    cur, chg, pct = get_safe_d1_data("GC=F")
     data['gold_price'] = cur
     data['gold_change'] = chg
     data['gold_pct'] = pct
     
-    # 2. US 10Y YIELD (^TNX) - Thay thế Breakeven bị lỗi
-    cur, chg, pct = get_realtime_data("^TNX")
-    data['us10y'] = cur
-    data['us10y_change'] = chg
-    data['us10y_pct'] = pct
+    # 2. US BREAKEVEN (Lạm phát kỳ vọng) - Giữ nguyên
+    # 10 Year (^T10YIE)
+    cur, chg, pct = get_safe_d1_data("^T10YIE")
+    data['be10_val'] = cur
+    data['be10_chg'] = chg
 
-    # 3. US 05Y YIELD (^FVX) - Thay thế Breakeven bị lỗi
-    cur, chg, pct = get_realtime_data("^FVX")
-    data['us05y'] = cur
-    data['us05y_change'] = chg
-    data['us05y_pct'] = pct
+    # 5 Year (^T5YIE) - Thay cho 2Y bị lỗi API
+    cur, chg, pct = get_safe_d1_data("^T5YIE")
+    data['be05_val'] = cur
+    data['be05_chg'] = chg
     
-    # 4. VIX (^VIX)
-    cur, chg, pct = get_realtime_data("^VIX")
+    # 3. VIX & GVZ
+    cur, chg, pct = get_safe_d1_data("^VIX")
     data['vix'] = cur
     data['vix_pct'] = pct
     
-    # 5. GVZ (^GVZ)
-    cur, chg, pct = get_realtime_data("^GVZ")
+    cur, chg, pct = get_safe_d1_data("^GVZ")
     data['gvz'] = cur
     data['gvz_pct'] = pct
 
-    # 6. GOLD H1 Range
+    # 4. GOLD H1 RANGE (Cho cảnh báo)
     data['gold_h1_range'] = get_gold_h1_range()
+    
+    # 5. SPDR & FED (Giữ hiển thị nhưng giá trị mặc định vì ko có API)
+    data['spdr_val'] = 0 
+    data['fed_val'] = 0
     
     return data
 
@@ -115,11 +122,11 @@ def send_telegram_msg(message):
         print(f"Lỗi Tele: {e}")
 
 # ==============================================================================
-# 3. ROUTING
+# 3. ROUTING & LOGIC
 # ==============================================================================
 @app.route('/')
 def home():
-    return "Bot Realtime Active"
+    return "Bot V7 Active - Full Features"
 
 @app.route('/run_check')
 def run_check():
@@ -129,50 +136,59 @@ def run_check():
     
     # --- A. CẢNH BÁO KHẨN CẤP ---
     
-    # 1. Vàng H1
+    # 1. Vàng H1 Sốc
     if data['gold_h1_range'] > CONFIG["GOLD_H1_LIMIT"]:
         if current_time - last_alert_times.get('GOLD_H1', 0) > CONFIG["ALERT_COOLDOWN"]:
-            alerts.append(f"🚨 <b>VÀNG H1 BIẾN ĐỘNG:</b> {data['gold_h1_range']:.1f} giá")
+            alerts.append(f"🚨 <b>VÀNG H1 CHẠY ĐIÊN:</b> {data['gold_h1_range']:.1f} giá")
             last_alert_times['GOLD_H1'] = current_time
 
-    # 2. VIX
+    # 2. VIX Sốc
     if data['vix'] > CONFIG["VIX_LIMIT"]:
         if current_time - last_alert_times.get('VIX', 0) > CONFIG["ALERT_COOLDOWN"]:
             alerts.append(f"⚠️ <b>VIX BÁO ĐỘNG ĐỎ:</b> {data['vix']:.2f}")
             last_alert_times['VIX'] = current_time
+            
+    # 3. GVZ Sốc
+    if data['gvz'] > CONFIG["GVZ_LIMIT"]:
+        if current_time - last_alert_times.get('GVZ', 0) > CONFIG["ALERT_COOLDOWN"]:
+            alerts.append(f"🌪 <b>GVZ BÃO VÀNG:</b> {data['gvz']:.2f}")
+            last_alert_times['GVZ'] = current_time
 
-    # Gửi cảnh báo
+    # 4. Lạm phát đảo chiều
+    if abs(data['be10_chg']) > CONFIG["BE_CHANGE_LIMIT"]:
+        if current_time - last_alert_times.get('BE10', 0) > CONFIG["ALERT_COOLDOWN"]:
+            tag = "TĂNG" if data['be10_chg'] > 0 else "GIẢM"
+            alerts.append(f"🇺🇸 <b>LẠM PHÁT 10Y {tag} SỐC:</b> {abs(data['be10_chg']):.3f} điểm")
+            last_alert_times['BE10'] = current_time
+
     if alerts:
         msg = "\n".join(alerts)
         send_telegram_msg(f"🔥🔥 <b>CẢNH BÁO KHẨN</b> 🔥🔥\n\n{msg}")
         return "Alert Sent"
 
-    # --- B. BÁO CÁO 30 PHÚT (STYLE INVESTING) ---
+    # --- B. BÁO CÁO 30 PHÚT (D1 - ĐẦY ĐỦ MỤC) ---
     current_minute = datetime.now().minute
-    # Chấp nhận phút 00-02 và 30-32
     if (0 <= current_minute <= 2) or (30 <= current_minute <= 32):
         
         def sign(val): return "+" if val >= 0 else ""
-
-        # Logic icon: Tăng dùng 🟢, Giảm dùng 🔴
         def icon(val): return "🟢" if val >= 0 else "🔴"
 
         status_msg = (
-            f"📊 <b>MARKET DASHBOARD (Realtime)</b>\n"
+            f"📊 <b>MARKET DASHBOARD (D1)</b>\n"
             f"Time: {datetime.now().strftime('%H:%M')}\n"
             f"-------------------------------\n"
-            f"🥇 <b>XAU/USD (Spot):</b> {data['gold_price']:.2f}\n"
-            f"   {icon(data['gold_change'])} {sign(data['gold_change'])}{data['gold_change']:.2f} ({sign(data['gold_pct'])}{data['gold_pct']:.2f}%)\n"
+            f"🥇 <b>Gold Futures:</b> {data['gold_price']:.1f}\n"
+            f"   {icon(data['gold_change'])} {sign(data['gold_change'])}{data['gold_change']:.1f}$ ({sign(data['gold_pct'])}{data['gold_pct']:.2f}%)\n"
             f"-------------------------------\n"
-            f"🇺🇸 <b>US Yields (Lợi suất):</b>\n"
-            f"   • 10Y: {data['us10y']:.3f}% ({sign(data['us10y_change'])}{data['us10y_change']:.3f})\n"
-            f"   • 05Y: {data['us05y']:.3f}% ({sign(data['us05y_change'])}{data['us05y_change']:.3f})\n"
+            f"🇺🇸 <b>Lạm phát Kỳ vọng (Breakeven):</b>\n"
+            f"   • 10Y: {data['be10_val']:.2f}% (Chg: {sign(data['be10_chg'])}{data['be10_chg']:.3f})\n"
+            f"   • 05Y: {data['be05_val']:.2f}% (Chg: {sign(data['be05_chg'])}{data['be05_chg']:.3f})\n"
             f"-------------------------------\n"
-            f"📉 <b>S&P 500 VIX:</b> {data['vix']:.2f}\n"
-            f"   {icon(data['vix_pct'])} {sign(data['vix_pct'])}{data['vix_pct']:.2f}%\n"
-            f"\n"
-            f"🌪 <b>CBOE Gold Vol (GVZ):</b> {data['gvz']:.2f}\n"
-            f"   {icon(data['gvz_pct'])} {sign(data['gvz_pct'])}{data['gvz_pct']:.2f}%\n"
+            f"📉 <b>VIX:</b> {data['vix']:.2f} ({sign(data['vix_pct'])}{data['vix_pct']:.1f}%)\n"
+            f"🌪 <b>GVZ:</b> {data['gvz']:.2f} ({sign(data['gvz_pct'])}{data['gvz_pct']:.1f}%)\n"
+            f"-------------------------------\n"
+            f"🐋 <b>SPDR:</b> {data['spdr_val']} tấn (N/A)\n"
+            f"⚖️ <b>FedWatch:</b> {data['fed_val']}% (N/A)\n"
         )
         send_telegram_msg(status_msg)
         return "Update Sent"
