@@ -1,253 +1,177 @@
-from flask import Flask
-import requests
+import yfinance as yf
+import ccxt
 import pandas as pd
-import io
+import pandas_ta as ta
 import time
-import random
-from datetime import datetime
-import pytz
+from datetime import datetime, timedelta
 
-app = Flask(__name__)
+# ================= CẤU HÌNH (CONFIG) =================
 
-# ==============================================================================
-# 1. CẤU HÌNH
-# ==============================================================================
-CONFIG = {
-    "TELEGRAM_TOKEN": "8309991075:AAFYyjFxQQ8CYECXPKeteeUBXQE3Mx2yfUo",
-    "TELEGRAM_CHAT_ID": "5464507208",
-    
-    "GOLD_H1_LIMIT": 30.0,
-    "RSI_HIGH": 80, "RSI_LOW": 20,
-    "VIX_LIMIT": 30, "BE_CHANGE_LIMIT": 0.15,
-    "ALERT_COOLDOWN": 3600
-}
+# 1. CẤU HÌNH THỜI GIAN
+CHECK_INTERVAL_SECONDS = 300    # Check mỗi 5 phút (300s)
+REPORT_INTERVAL_MINUTES = 30    # Gửi báo cáo định kỳ mỗi 30 phút
+BREAKEVEN_CHECK_HOUR = 7        # Giờ check Breakeven (7h sáng)
 
-# Cache dữ liệu vĩ mô (10 phút cập nhật 1 lần)
-GLOBAL_CACHE = {
-    'vix': {'p': 0, 'c': 0, 'pct': 0},
-    'gvz': {'p': 0, 'c': 0, 'pct': 0},
-    'be10': {'p': 0, 'c': 0},
-    'be05': {'p': 0, 'c': 0},
-    'spdr': {'v': 0, 'c': 0},
-    'last_success_time': 0
-}
+# 2. NGƯỠNG CẢNH BÁO (ALERTS)
+# VIX & GVZ
+VIX_LIMIT = 30
+VIX_CHANGE_PCT = 15.0
+GVZ_LIMIT = 25
+GVZ_CHANGE_PCT = 10.0
 
-last_alert_times = {}
+# Vàng (Gold)
+RSI_UPPER = 80
+RSI_LOWER = 20
+CANDLE_H1_SIZE = 40.0
 
-# ==============================================================================
-# 2. VÀNG BINANCE (REALTIME 1 PHÚT)
-# ==============================================================================
-def get_gold_binance():
+# FedWatch (Dùng ^IRX làm tham chiếu)
+FED_RATE_CHANGE_PCT = 15.0      # Báo nếu kỳ vọng lãi suất đổi 15%
+
+# ================= HÀM XỬ LÝ DỮ LIỆU =================
+
+def get_gold_realtime():
+    """Lấy dữ liệu Vàng từ Binance (Nhanh, chuẩn)"""
     try:
-        r = requests.get("https://api.binance.com/api/v3/ticker/24hr?symbol=PAXGUSDT", timeout=15)
-        data = r.json()
+        exchange = ccxt.binance()
+        ohlcv = exchange.fetch_ohlcv('PAXG/USDT', timeframe='1h', limit=50)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         
-        # Klines RSI
-        kr = requests.get("https://api.binance.com/api/v3/klines?symbol=PAXGUSDT&interval=1h&limit=20", timeout=15)
-        k_data = kr.json()
-        closes = [float(x[4]) for x in k_data]
+        df['rsi'] = ta.rsi(df['close'], length=14)
+        current = df.iloc[-1]
+        candle_size = current['high'] - current['low']
         
-        if len(closes) >= 15:
-            prices = pd.Series(closes)
-            delta = prices.diff()
-            gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-            rs = gain / loss
-            rsi = 100 - (100 / (1 + rs))
-            curr_rsi = float(rsi.iloc[-1])
-        else: curr_rsi = 50.0
-
-        last = k_data[-1]
-        h1 = float(last[2]) - float(last[3])
-
         return {
-            'p': float(data['lastPrice']), 
-            'c': float(data['priceChange']), 
-            'pct': float(data['priceChangePercent']),
-            'h1': h1, 'rsi': curr_rsi, 'src': 'Binance (1p)'
+            'price': current['close'],
+            'rsi': current['rsi'],
+            'candle_size': candle_size
         }
-    except: return None
-
-# ==============================================================================
-# 3. YAHOO MACRO (5-10 PHÚT/LẦN)
-# ==============================================================================
-def get_yahoo_smart(symbol):
-    try:
-        # Danh sách User-Agent phong phú để tránh bị chặn
-        uas = [
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/605.1.15',
-            'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/602.1.50 (KHTML, like Gecko) Version/17.0 Mobile/14E5239e Safari/602.1'
-        ]
-        headers = {"User-Agent": random.choice(uas)}
-        
-        # Dùng API query2 của Yahoo
-        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=5d"
-        r = requests.get(url, headers=headers, timeout=10)
-        data = r.json()
-        
-        result = data['chart']['result'][0]
-        quote = result['indicators']['quote'][0]
-        closes = [c for c in quote['close'] if c is not None]
-        
-        if len(closes) < 2: return None
-        
-        cur = closes[-1]
-        prev = closes[-2]
-        # Trả về: Giá, Thay đổi tuyệt đối, % Thay đổi
-        return cur, cur - prev, (cur - prev)/prev*100
-    except: return None
-
-def get_spdr_smart():
-    try:
-        url = "https://www.spdrgoldshares.com/assets/dynamic/GLD/GLD_US_archive_EN.csv"
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10, verify=False)
-        if r.status_code == 200:
-            df = pd.read_csv(io.StringIO(r.text), skiprows=6)
-            col = [c for c in df.columns if "Tonnes" in str(c)]
-            if col:
-                df = df.dropna(subset=[col[0]])
-                if len(df) >= 2:
-                    curr = float(df.iloc[-1][col[0]])
-                    prev = float(df.iloc[-2][col[0]])
-                    return curr, curr - prev
+    except:
         return None
-    except: return None
 
-# ==============================================================================
-# 4. UPDATE LOGIC
-# ==============================================================================
-def update_macro_data():
-    global GLOBAL_CACHE
-    current_time = time.time()
-    
-    # Update mỗi 5 phút (300s)
-    if current_time - GLOBAL_CACHE['last_success_time'] < 300:
-        return
-        
-    # 1. VIX & GVZ
-    res = get_yahoo_smart("^VIX")
-    if res: GLOBAL_CACHE['vix'] = {'p': res[0], 'c': res[1], 'pct': res[2]}
-    
-    res = get_yahoo_smart("^GVZ")
-    if res: GLOBAL_CACHE['gvz'] = {'p': res[0], 'c': res[1], 'pct': res[2]}
-    
-    # 2. SPDR
-    res = get_spdr_smart()
-    if res: GLOBAL_CACHE['spdr'] = {'v': res[0], 'c': res[1]}
-    
-    # 3. LẠM PHÁT (Chỉ lấy đúng mã Breakeven)
-    res10 = get_yahoo_smart("^T10YIE")
-    if res10: GLOBAL_CACHE['be10'] = {'p': res10[0], 'c': res10[1]}
-    
-    res05 = get_yahoo_smart("^T5YIE")
-    if res05: GLOBAL_CACHE['be05'] = {'p': res05[0], 'c': res05[1]}
-    
-    GLOBAL_CACHE['last_success_time'] = current_time
-
-def get_data_final():
-    gold = get_gold_binance()
-    if not gold: 
-        gold = {'p': 0, 'c': 0, 'pct': 0, 'h1': 0, 'rsi': 50, 'src': 'Mất kết nối'}
-    
-    update_macro_data()
-    return gold, GLOBAL_CACHE
-
-def send_tele(msg):
+def get_market_data(check_breakeven=False):
+    """
+    Lấy VIX, GVZ, IRX (Fed Proxy).
+    check_breakeven=True thì mới lấy dữ liệu Lạm phát.
+    """
     try:
-        requests.post(f"https://api.telegram.org/bot{CONFIG['TELEGRAM_TOKEN']}/sendMessage", 
-                      json={"chat_id": CONFIG['TELEGRAM_CHAT_ID'], "text": msg, "parse_mode": "HTML"})
-    except: pass
+        # ^IRX là Lợi suất trái phiếu 13 tuần (Proxy tốt nhất cho lãi suất FED ngắn hạn)
+        symbols = "^VIX ^GVZ ^IRX" 
+        if check_breakeven:
+            symbols += " ^T10YIE" # Thêm Breakeven nếu đến giờ check
 
-# ==============================================================================
-# 5. ROUTING
-# ==============================================================================
-@app.route('/')
-def home(): return "Bot V25 - Format Fix"
-
-@app.route('/run_check')
-def run_check():
-    try:
-        gold, macro = get_data_final()
-        alerts = []
-        now = time.time()
+        data = yf.download(symbols, period="5d", progress=False)
         
-        # CẢNH BÁO
-        if gold['rsi'] > CONFIG['RSI_HIGH'] and gold['h1'] > 20:
-            if now - last_alert_times.get('RSI', 0) > CONFIG['ALERT_COOLDOWN']:
-                alerts.append(f"🚀 <b>SIÊU TREND TĂNG:</b> RSI {gold['rsi']:.0f} + H1 {gold['h1']:.1f}$")
-                last_alert_times['RSI'] = now
-        if gold['rsi'] < CONFIG['RSI_LOW'] and gold['h1'] > 20:
-            if now - last_alert_times.get('RSI', 0) > CONFIG['ALERT_COOLDOWN']:
-                alerts.append(f"🩸 <b>SIÊU TREND GIẢM:</b> RSI {gold['rsi']:.0f} + H1 {gold['h1']:.1f}$")
-                last_alert_times['RSI'] = now
-        if gold['h1'] > CONFIG['GOLD_H1_LIMIT']:
-            if now - last_alert_times.get('H1', 0) > CONFIG['ALERT_COOLDOWN']:
-                alerts.append(f"🚨 <b>VÀNG BIẾN ĐỘNG:</b> H1 {gold['h1']:.1f} giá")
-                last_alert_times['H1'] = now
+        def get_val(sym):
+            try:
+                s = data['Close'][sym].dropna()
+                if s.empty: return 0, 0
+                curr, prev = s.iloc[-1], s.iloc[-2]
+                chg = ((curr - prev) / prev) * 100
+                return curr, chg
+            except: return 0, 0
+
+        vix, vix_chg = get_val('^VIX')
+        gvz, gvz_chg = get_val('^GVZ')
+        irx, irx_chg = get_val('^IRX') # Fed Rate Sentiment
         
-        if macro['vix']['p'] > CONFIG['VIX_LIMIT']:
-             if now - last_alert_times.get('VIX', 0) > CONFIG['ALERT_COOLDOWN']:
-                alerts.append(f"⚠️ <b>VIX CAO:</b> {macro['vix']['p']:.2f}")
-                last_alert_times['VIX'] = now
-        if abs(macro['be10']['c']) > CONFIG['BE_CHANGE_LIMIT']:
-            if now - last_alert_times.get('BE', 0) > CONFIG['ALERT_COOLDOWN']:
-                alerts.append(f"🇺🇸 <b>LẠM PHÁT BIẾN ĐỘNG:</b> {abs(macro['be10']['c']):.3f} điểm")
-                last_alert_times['BE'] = now
+        result = {
+            'vix': vix, 'vix_chg': vix_chg,
+            'gvz': gvz, 'gvz_chg': gvz_chg,
+            'fed_proxy': irx, 'fed_chg': irx_chg
+        }
 
-        if alerts:
-            send_tele(f"🔥🔥 <b>CẢNH BÁO KHẨN</b> 🔥🔥\n\n" + "\n".join(alerts))
-            return "Alert Sent", 200
-
-        # DASHBOARD
-        vn_now = datetime.now(pytz.timezone('Asia/Ho_Chi_Minh'))
-        if vn_now.minute in [0, 1, 30, 31]:
-            def s(v): return "+" if v >= 0 else ""
-            def i(v): return "🟢" if v >= 0 else "🔴"
-            
-            # Format SPDR
-            spdr_txt = f"{macro['spdr']['v']:.2f} tấn" if macro['spdr']['v'] > 0 else "Chờ cập nhật"
-            spdr_chg = f"({s(macro['spdr']['c'])}{macro['spdr']['c']:.2f})" if macro['spdr']['v'] > 0 else ""
-            
-            # Format VIX/GVZ (Thêm %)
-            if macro['vix']['p'] > 0:
-                vix_txt = f"{macro['vix']['p']:.2f} ({s(macro['vix']['pct'])}{macro['vix']['pct']:.2f}%)"
-            else: vix_txt = "N/A"
-            
-            if macro['gvz']['p'] > 0:
-                gvz_txt = f"{macro['gvz']['p']:.2f} ({s(macro['gvz']['pct'])}{macro['gvz']['pct']:.2f}%)"
-            else: gvz_txt = "N/A"
-
-            # Format Breakeven
-            be10_txt = f"{macro['be10']['p']:.2f}%" if macro['be10']['p'] > 0 else "N/A"
-            be05_txt = f"{macro['be05']['p']:.2f}%" if macro['be05']['p'] > 0 else "N/A"
-
-            msg = (
-                f"📊 <b>MARKET DASHBOARD (D1)</b>\n"
-                f"Time: {vn_now.strftime('%H:%M')}\n"
-                f"Nguồn Vàng: {gold['src']}\n"
-                f"-------------------------------\n"
-                f"🥇 <b>GOLD (PAXG):</b> {gold['p']:.1f}\n"
-                f"   {i(gold['c'])} {s(gold['c'])}{gold['c']:.1f}$ ({s(gold['pct'])}{gold['pct']:.2f}%)\n"
-                f"   🎯 <b>RSI (H1):</b> {gold['rsi']:.1f}\n"
-                f"-------------------------------\n"
-                f"🐋 <b>SPDR Gold:</b> {spdr_txt} {spdr_chg}\n"
-                f"-------------------------------\n"
-                f"🇺🇸 <b>Lạm phát (Breakeven):</b>\n"
-                f"   • 10Y: {be10_txt} (Chg: {s(macro['be10']['c'])}{macro['be10']['c']:.3f})\n"
-                f"   • 05Y: {be05_txt} (Chg: {s(macro['be05']['c'])}{macro['be05']['c']:.3f})\n"
-                f"-------------------------------\n"
-                f"📉 <b>Risk:</b>\n"
-                f"   • VIX: {vix_txt}\n"
-                f"   • GVZ: {gvz_txt}\n"
-            )
-            send_tele(msg)
-            return "Report Sent", 200
-
-        return "Checked", 200
+        if check_breakeven:
+            be, be_chg = get_val('^T10YIE')
+            result['breakeven'] = be
+        
+        return result
     except Exception as e:
-        print(f"Err: {e}")
-        return "Error", 200
+        print(f"Lỗi Yahoo: {e}")
+        return None
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+# ================= LOGIC CHÍNH =================
+
+print("=== BOT V29: FEDWATCH & SCHEDULED REPORT STARTED ===")
+print(f"- Check mỗi {CHECK_INTERVAL_SECONDS/60} phút.")
+print(f"- Báo cáo tổng hợp mỗi {REPORT_INTERVAL_MINUTES} phút.")
+print(f"- Breakeven check lúc {BREAKEVEN_CHECK_HOUR}:00 hàng ngày.")
+
+last_report_time = datetime.now() - timedelta(minutes=REPORT_INTERVAL_MINUTES) # Để chạy ngay lần đầu
+breakeven_data_cached = "Chưa cập nhật" # Lưu kết quả Breakeven để hiển thị lại
+
+while True:
+    now = datetime.now()
+    alerts = []
+    
+    # 1. QUYẾT ĐỊNH CÓ CHECK BREAKEVEN KHÔNG?
+    # Chỉ check nếu đang ở giờ quy định (ví dụ 7h00 - 7h05)
+    do_check_breakeven = False
+    if now.hour == BREAKEVEN_CHECK_HOUR and now.minute < 10:
+        do_check_breakeven = True
+        
+    # 2. LẤY DỮ LIỆU
+    gold = get_gold_realtime()
+    market = get_market_data(check_breakeven=do_check_breakeven)
+    
+    # Cập nhật cache Breakeven nếu vừa lấy được
+    if market and 'breakeven' in market:
+        breakeven_data_cached = f"{market['breakeven']:.2f}%"
+
+    # 3. KIỂM TRA CẢNH BÁO (ALERTS) - BÁO NGAY LẬP TỨC
+    if gold and market:
+        # --- Check Vàng ---
+        if gold['rsi'] >= RSI_UPPER:
+            alerts.append(f"🔥 RSI VÀNG NÓNG: {gold['rsi']:.1f} (>=80)")
+        if gold['rsi'] <= RSI_LOWER:
+            alerts.append(f"❄️ RSI VÀNG LẠNH: {gold['rsi']:.1f} (<=20)")
+        if gold['candle_size'] >= CANDLE_H1_SIZE:
+            alerts.append(f"⚡ VÀNG GIẬT MẠNH: Nến H1 chạy {gold['candle_size']:.1f} giá")
+            
+        # --- Check VIX/GVZ ---
+        if market['vix'] >= VIX_LIMIT or market['vix_chg'] >= VIX_CHANGE_PCT:
+            alerts.append(f"☠️ VIX BÁO ĐỘNG: {market['vix']:.2f} (+{market['vix_chg']:.1f}%)")
+        if market['gvz'] >= GVZ_LIMIT or market['gvz_chg'] >= GVZ_CHANGE_PCT:
+            alerts.append(f"⚠️ GVZ BÁO ĐỘNG: {market['gvz']:.2f} (+{market['gvz_chg']:.1f}%)")
+            
+        # --- Check Fed Expectation (^IRX) ---
+        if abs(market['fed_chg']) >= FED_RATE_CHANGE_PCT:
+             alerts.append(f"🏦 FED WATCH: Kỳ vọng lãi suất biến động mạnh ({market['fed_chg']:.1f}%)!")
+
+    # 4. XỬ LÝ GỬI TIN
+    # A. Nếu có CẢNH BÁO KHẨN -> Gửi ngay lập tức
+    if alerts:
+        print(f"\n[{now.strftime('%H:%M')}] 🚨 PHÁT HIỆN TÍN HIỆU:")
+        for msg in alerts:
+            print(f"- {msg}")
+            # CODE GỬI TELEGRAM KHẨN Ở ĐÂY
+    
+    # B. Nếu không có cảnh báo -> Kiểm tra xem đã đến giờ gửi Báo cáo định kỳ chưa?
+    elif (now - last_report_time).total_seconds() >= (REPORT_INTERVAL_MINUTES * 60):
+        # Tạo nội dung báo cáo
+        r = gold['rsi'] if gold else 0
+        p = gold['price'] if gold else 0
+        v = market['vix'] if market else 0
+        g = market['gvz'] if market else 0
+        f = market['fed_proxy'] if market else 0
+        
+        report = (
+            f"\n[{now.strftime('%H:%M')}] 📊 BÁO CÁO ĐỊNH KỲ (30p):\n"
+            f"--------------------------\n"
+            f"• Vàng: {p:.1f}$ | RSI: {r:.1f}\n"
+            f"• Risk: VIX {v:.1f} | GVZ {g:.1f}\n"
+            f"• Fed Watch (IRX): {f:.2f}%\n"
+            f"• Lạm phát (BE): {breakeven_data_cached}\n"
+            f"--------------------------"
+        )
+        print(report)
+        # CODE GỬI TELEGRAM REPORT Ở ĐÂY
+        
+        # Reset thời gian
+        last_report_time = now
+        
+    else:
+        # In dòng trạng thái chờ (cho bạn biết code vẫn chạy)
+        print(f"Checking... (Next Report: {((REPORT_INTERVAL_MINUTES*60) - (now - last_report_time).total_seconds())/60:.0f} min)", end="\r")
+
+    # 5. NGỦ (Sleep)
+    time.sleep(CHECK_INTERVAL_SECONDS)
