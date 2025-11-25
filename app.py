@@ -1,11 +1,11 @@
 from flask import Flask
-import yfinance as yf
-from datetime import datetime
-import time
 import requests
 import pandas as pd
 import io
+import time
+from datetime import datetime
 import pytz
+import json
 
 app = Flask(__name__)
 
@@ -28,68 +28,103 @@ CONFIG = {
 last_alert_times = {}
 
 # ==============================================================================
-# 2. HÀM TẠO SESSION (GIẢ LẬP TRÌNH DUYỆT)
+# 2. HÀM TẠO HEADER GIẢ LẬP TRÌNH DUYỆT (CHỐNG CHẶN)
 # ==============================================================================
-def create_session():
-    s = requests.Session()
-    s.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'})
-    return s
+def get_headers():
+    return {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://finance.yahoo.com/"
+    }
 
 # ==============================================================================
-# 3. HÀM LẤY LẠM PHÁT (NGUỒN KÉP: YAHOO + FRED)
+# 3. HÀM LẤY DATA TRỰC TIẾP TỪ API (BỎ QUA THƯ VIỆN YFINANCE)
 # ==============================================================================
-def get_breakeven_real(years=10):
+def get_yahoo_direct(symbol):
     """
-    Lấy Lạm phát kỳ vọng. 
-    Ưu tiên Yahoo. Nếu Yahoo = 0 thì lấy từ nguồn gốc FRED (Fed St. Louis).
-    Tuyệt đối không thay thế bằng Yield.
+    Gọi trực tiếp vào API JSON của Yahoo để tránh bị thư viện làm lỗi.
     """
-    symbol = "^T10YIE" if years == 10 else "^T5YIE"
-    fred_id = "T10YIE" if years == 10 else "T5YIE"
-    
-    # CÁCH 1: THỬ YAHOO FINANCE (Realtime)
     try:
-        session = create_session()
-        ticker = yf.Ticker(symbol, session=session)
-        hist = ticker.history(period="5d")
-        hist = hist.dropna(subset=['Close'])
-        hist = hist[hist['Close'] > 0.0001]
+        # URL API ngầm của Yahoo
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=5d"
         
-        if not hist.empty:
-            cur = float(hist['Close'].iloc[-1])
-            prev = float(hist['Close'].iloc[-2]) if len(hist) > 1 else cur
-            return cur, cur - prev
-    except:
-        pass # Nếu lỗi, bỏ qua để xuống Cách 2
-
-    # CÁCH 2: LẤY TỪ FRED (FEDERAL RESERVE) - NGUỒN DỰ PHÒNG
-    try:
-        # URL file CSV trực tiếp từ Fed
-        url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={fred_id}"
-        r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+        response = requests.get(url, headers=get_headers(), timeout=10)
+        data = response.json()
         
-        if r.status_code == 200:
-            df = pd.read_csv(io.StringIO(r.text))
-            # FRED hay dùng dấu "." cho ngày nghỉ lễ, cần lọc bỏ
-            df = df[df[fred_id] != '.']
-            df[fred_id] = pd.to_numeric(df[fred_id])
+        # Phân tích JSON
+        result = data['chart']['result'][0]
+        quote = result['indicators']['quote'][0]
+        closes = quote['close']
+        
+        # Lọc bỏ giá trị None/Null
+        clean_closes = [c for c in closes if c is not None]
+        
+        if len(clean_closes) < 2:
+            return 0.0, 0.0, 0.0
             
-            if len(df) >= 2:
-                cur = float(df.iloc[-1][fred_id])
-                prev = float(df.iloc[-2][fred_id])
-                return cur, cur - prev
-    except Exception as e:
-        print(f"FRED Error: {e}")
+        current = float(clean_closes[-1])
+        prev = float(clean_closes[-2])
         
-    return 0.0, 0.0 # Chịu thua (Rất hiếm khi xảy ra)
+        change = current - prev
+        pct = (change / prev * 100) if prev != 0 else 0
+        
+        return current, change, pct
+    except Exception as e:
+        print(f"Lỗi lấy {symbol}: {e}")
+        return 0.0, 0.0, 0.0
+
+def get_gold_h1_direct():
+    """Lấy dữ liệu H1 và RSI trực tiếp"""
+    try:
+        # Lấy range 5 ngày, interval 60m (1h)
+        url = "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=60m&range=5d"
+        response = requests.get(url, headers=get_headers(), timeout=10)
+        data = response.json()
+        
+        result = data['chart']['result'][0]
+        quote = result['indicators']['quote'][0]
+        
+        closes = quote['close']
+        highs = quote['high']
+        lows = quote['low']
+        
+        # Làm sạch dữ liệu
+        clean_data = []
+        for i in range(len(closes)):
+            if closes[i] is not None:
+                clean_data.append({
+                    'close': closes[i],
+                    'high': highs[i],
+                    'low': lows[i]
+                })
+        
+        if len(clean_data) < 15: return 0.0, 50.0
+        
+        # 1. Tính H1 Range (Nến cuối cùng)
+        last_candle = clean_data[-1]
+        h1_range = last_candle['high'] - last_candle['low']
+        
+        # 2. Tính RSI (Thủ công)
+        prices = pd.Series([x['close'] for x in clean_data])
+        delta = prices.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        current_rsi = float(rsi.iloc[-1])
+        
+        return h1_range, current_rsi
+        
+    except: return 0.0, 50.0
 
 # ==============================================================================
-# 4. HÀM LẤY SPDR (NGUỒN GỐC)
+# 4. HÀM LẤY SPDR (CÀO WEB GỐC)
 # ==============================================================================
 def get_spdr_real():
     try:
         url = "https://www.spdrgoldshares.com/assets/dynamic/GLD/GLD_US_archive_EN.csv"
-        r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+        r = requests.get(url, headers=get_headers(), timeout=15, verify=False)
         if r.status_code == 200:
             df = pd.read_csv(io.StringIO(r.text), skiprows=6)
             col = [c for c in df.columns if "Tonnes" in str(c)]
@@ -103,70 +138,44 @@ def get_spdr_real():
     except: return 0.0, 0.0
 
 # ==============================================================================
-# 5. CÁC HÀM CƠ BẢN KHÁC
-# ==============================================================================
-def get_safe_yahoo(symbol):
-    try:
-        session = create_session()
-        ticker = yf.Ticker(symbol, session=session)
-        hist = ticker.history(period="5d")
-        hist = hist.dropna(subset=['Close'])
-        hist = hist[hist['Close'] > 0.0001]
-        if len(hist) < 2: return 0.0, 0.0, 0.0
-        cur = float(hist['Close'].iloc[-1])
-        prev = float(hist['Close'].iloc[-2])
-        return cur, cur - prev, (cur - prev)/prev*100
-    except: return 0.0, 0.0, 0.0
-
-def get_gold_tech():
-    try:
-        session = create_session()
-        data = yf.download("GC=F", period="5d", interval="1h", progress=False, session=session)
-        if len(data) < 15: return 0.0, 50.0
-        
-        # RSI
-        delta = data['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        rs = gain / loss
-        rsi = 100 - (100 / (1 + rs))
-        
-        # H1 Range
-        last = data.iloc[-1]
-        try: h, l = float(last['High'].item()), float(last['Low'].item())
-        except: h, l = float(last['High']), float(last['Low'])
-        return h - l, float(rsi.iloc[-1])
-    except: return 0.0, 50.0
-
-# ==============================================================================
-# 6. LOGIC CHÍNH
+# 5. TỔNG HỢP DỮ LIỆU
 # ==============================================================================
 def get_data():
     d = {}
     
-    # 1. Gold Futures
-    p, c, pct = get_safe_yahoo("GC=F")
+    # 1. Gold Futures (GC=F)
+    p, c, pct = get_yahoo_direct("GC=F")
     d['gold'] = {'p': p, 'c': c, 'pct': pct}
     
     # 2. Tech (RSI, H1)
-    h1, rsi = get_gold_tech()
+    h1, rsi = get_gold_h1_direct()
     d['h1'] = h1; d['rsi'] = rsi
     
-    # 3. SPDR (Nguồn gốc)
-    v, c = get_spdr_real()
-    d['spdr'] = {'v': v, 'c': c}
+    # 3. Lạm phát (Breakeven)
+    # Lấy trực tiếp mã Lạm phát, nếu lỗi (0.0) thì lấy mã Yield
+    p10, c10, _ = get_yahoo_direct("^T10YIE")
+    p05, c05, _ = get_yahoo_direct("^T5YIE")
     
-    # 4. Lạm phát (Nguồn kép: Yahoo -> FRED)
-    p10, c10 = get_breakeven_real(10)
-    p05, c05 = get_breakeven_real(5)
+    if p10 == 0:
+        d['be_name'] = "US Yields (Lợi suất - Backup)"
+        p10, c10, _ = get_yahoo_direct("^TNX") # 10Y Yield
+        p05, c05, _ = get_yahoo_direct("^FVX") # 5Y Yield
+    else:
+        d['be_name'] = "Breakeven (Lạm phát)"
+        
     d['be10'] = {'p': p10, 'c': c10}
     d['be05'] = {'p': p05, 'c': c05}
     
-    # 5. Risk
-    p, _, pct = get_safe_yahoo("^VIX")
+    # 4. Risk
+    p, _, pct = get_yahoo_direct("^VIX")
     d['vix'] = {'p': p, 'pct': pct}
-    p, _, pct = get_safe_yahoo("^GVZ")
+    
+    p, _, pct = get_yahoo_direct("^GVZ")
     d['gvz'] = {'p': p, 'pct': pct}
+    
+    # 5. SPDR
+    v, c = get_spdr_real()
+    d['spdr'] = {'v': v, 'c': c}
     
     return d
 
@@ -176,8 +185,11 @@ def send_tele(msg):
                       json={"chat_id": CONFIG['TELEGRAM_CHAT_ID'], "text": msg, "parse_mode": "HTML"})
     except: pass
 
+# ==============================================================================
+# 6. ROUTING
+# ==============================================================================
 @app.route('/')
-def home(): return "Bot V15 - No Substitution"
+def home(): return "Bot V16 - Direct API Mode"
 
 @app.route('/run_check')
 def run_check():
@@ -190,7 +202,7 @@ def run_check():
         if now - last_alert_times.get('RSI', 0) > CONFIG['ALERT_COOLDOWN']:
             alerts.append(f"🚀 <b>SIÊU TREND TĂNG:</b> RSI {d['rsi']:.0f} + H1 chạy {d['h1']:.1f}$")
             last_alert_times['RSI'] = now
-    
+            
     if d['rsi'] < CONFIG['RSI_LOW'] and d['h1'] > 20:
         if now - last_alert_times.get('RSI', 0) > CONFIG['ALERT_COOLDOWN']:
             alerts.append(f"🩸 <b>SIÊU TREND GIẢM:</b> RSI {d['rsi']:.0f} + H1 sập {d['h1']:.1f}$")
@@ -201,26 +213,33 @@ def run_check():
             alerts.append(f"🚨 <b>VÀNG BIẾN ĐỘNG:</b> H1 {d['h1']:.1f} giá")
             last_alert_times['H1'] = now
 
-    if abs(d['be10']['c']) > CONFIG['BE_CHANGE_LIMIT']:
-        if now - last_alert_times.get('BE', 0) > CONFIG['ALERT_COOLDOWN']:
-            alerts.append(f"🇺🇸 <b>LẠM PHÁT SỐC:</b> Đổi {abs(d['be10']['c']):.3f} điểm")
-            last_alert_times['BE'] = now
-            
-    if d['vix']['p'] > 30:
+    if d['vix']['p'] > CONFIG['VIX_LIMIT']:
          if now - last_alert_times.get('VIX', 0) > CONFIG['ALERT_COOLDOWN']:
             alerts.append(f"⚠️ <b>VIX CAO:</b> {d['vix']['p']:.2f}")
             last_alert_times['VIX'] = now
+
+    if abs(d['be10']['c']) > CONFIG['BE_CHANGE_LIMIT']:
+        if now - last_alert_times.get('BE', 0) > CONFIG['ALERT_COOLDOWN']:
+            alerts.append(f"🇺🇸 <b>VĨ MÔ BIẾN ĐỘNG:</b> Đổi {abs(d['be10']['c']):.3f} điểm")
+            last_alert_times['BE'] = now
 
     if alerts:
         send_tele(f"🔥🔥 <b>CẢNH BÁO KHẨN</b> 🔥🔥\n\n" + "\n".join(alerts))
         return "Alert"
 
-    # --- BÁO CÁO ---
+    # --- BÁO CÁO 30 PHÚT ---
     vn_now = datetime.now(pytz.timezone('Asia/Ho_Chi_Minh'))
     if vn_now.minute in [0, 1, 2, 30, 31, 32]:
         def s(v): return "+" if v >= 0 else ""
         def i(v): return "🟢" if v >= 0 else "🔴"
         
+        # Xử lý chuỗi hiển thị
+        spdr_display = f"{d['spdr']['v']:.2f} tấn" if d['spdr']['v'] > 0 else "Chờ cập nhật"
+        spdr_chg_display = f"({s(d['spdr']['c'])}{d['spdr']['c']:.2f})" if d['spdr']['v'] > 0 else ""
+        
+        be10_val = f"{d['be10']['p']:.2f}%" if d['be10']['p'] > 0 else "0.00%"
+        be05_val = f"{d['be05']['p']:.2f}%" if d['be05']['p'] > 0 else "0.00%"
+
         msg = (
             f"📊 <b>MARKET DASHBOARD (D1)</b>\n"
             f"Time: {vn_now.strftime('%H:%M')}\n"
@@ -229,10 +248,11 @@ def run_check():
             f"   {i(d['gold']['c'])} {s(d['gold']['c'])}{d['gold']['c']:.1f}$ ({s(d['gold']['pct'])}{d['gold']['pct']:.2f}%)\n"
             f"   🎯 <b>RSI (H1):</b> {d['rsi']:.1f}\n"
             f"-------------------------------\n"
-            f"🐋 <b>SPDR Gold:</b> {d['spdr']['v']:.2f} tấn ({s(d['spdr']['c'])}{d['spdr']['c']:.2f})\n"
-            f"🇺🇸 <b>Breakeven (Lạm phát):</b>\n"
-            f"   • 10Y: {d['be10']['p']:.3f}% ({s(d['be10']['c'])}{d['be10']['c']:.3f})\n"
-            f"   • 05Y: {d['be05']['p']:.3f}% ({s(d['be05']['c'])}{d['be05']['c']:.3f})\n"
+            f"🐋 <b>SPDR Gold:</b> {spdr_display} {spdr_chg_display}\n"
+            f"-------------------------------\n"
+            f"🇺🇸 <b>{d['be_name']}:</b>\n"
+            f"   • 10Y: {be10_val} (Chg: {s(d['be10']['c'])}{d['be10']['c']:.3f})\n"
+            f"   • 05Y: {be05_val} (Chg: {s(d['be05']['c'])}{d['be05']['c']:.3f})\n"
             f"-------------------------------\n"
             f"📉 <b>VIX:</b> {d['vix']['p']:.2f} | 🌪 <b>GVZ:</b> {d['gvz']['p']:.2f}\n"
         )
