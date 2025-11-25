@@ -6,3 +6,8 @@ beautifulsoup4
 gunicorn
 pandas
 lxml
+Flask
+requests
+yfinance
+pandas
+pytz
