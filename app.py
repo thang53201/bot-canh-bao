@@ -10,19 +10,25 @@ import pytz
 app = Flask(__name__)
 
 # ==============================================================================
-# 1. CẤU HÌNH
+# 1. CẤU HÌNH (ĐẦY ĐỦ NGƯỠNG)
 # ==============================================================================
 CONFIG = {
     "TELEGRAM_TOKEN": "8309991075:AAFYyjFxQQ8CYECXPKeteeUBXQE3Mx2yfUo",
     "TELEGRAM_CHAT_ID": "5464507208",
     
-    # NGƯỠNG CẢNH BÁO
+    # CẢNH BÁO VÀNG (1 PHÚT)
     "GOLD_H1_LIMIT": 40.0,
     "RSI_HIGH": 82, "RSI_LOW": 18, "RSI_PRICE_MOVE": 30.0,
     
+    # CẢNH BÁO VĨ MÔ (5 PHÚT)
     "VIX_VAL_LIMIT": 30, "VIX_PCT_LIMIT": 15.0,
     "GVZ_VAL_LIMIT": 25, "GVZ_PCT_LIMIT": 10.0,
-    "INF_10Y_LIMIT": 0.25, "INF_05Y_LIMIT": 0.20,
+    
+    # LẠM PHÁT / YIELD (ĐIỂM SỐ)
+    "INF_10Y_LIMIT": 0.25,  # 10 Năm > 0.25
+    "INF_05Y_LIMIT": 0.20,  # 5 Năm (2Y) > 0.20 (Nhạy hơn)
+    
+    # FEDWATCH (%)
     "FED_PCT_LIMIT": 15.0,
     
     "ALERT_COOLDOWN": 3600
@@ -42,7 +48,7 @@ GLOBAL_CACHE = {
 last_alert_times = {}
 
 # ==============================================================================
-# 2. HÀM FRED (DỰ PHÒNG LẠM PHÁT)
+# 2. HÀM LẤY DỮ LIỆU TỪ FRED (DỰ PHÒNG)
 # ==============================================================================
 def get_fred_data(series_id):
     try:
@@ -61,7 +67,7 @@ def get_fred_data(series_id):
     except: return None
 
 # ==============================================================================
-# 3. VÀNG BINANCE
+# 3. CÁC HÀM KHÁC
 # ==============================================================================
 def get_gold_binance():
     try:
@@ -87,9 +93,6 @@ def get_gold_binance():
         return {'p': float(data['lastPrice']), 'c': float(data['priceChange']), 'pct': float(data['priceChangePercent']), 'h1': h1, 'rsi': curr_rsi, 'src': 'Binance'}
     except: return None
 
-# ==============================================================================
-# 4. YAHOO & SPDR
-# ==============================================================================
 def get_yahoo_data(symbol):
     try:
         uas = ['Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)']
@@ -120,7 +123,7 @@ def get_spdr_smart():
     except: return None
 
 # ==============================================================================
-# 5. UPDATE LOGIC
+# 4. UPDATE LOGIC
 # ==============================================================================
 def update_macro_data():
     global GLOBAL_CACHE
@@ -139,7 +142,8 @@ def update_macro_data():
     res = get_spdr_smart()
     if res: GLOBAL_CACHE['spdr'] = {'v': res[0], 'c': res[1]}
     
-    # 3. LẠM PHÁT
+    # 3. LẠM PHÁT (Yahoo -> FRED -> Yield)
+    # 10Y
     res10 = get_yahoo_data("^T10YIE")
     if res10:
         GLOBAL_CACHE['be_source'] = "Lạm phát (Yahoo)"
@@ -155,6 +159,7 @@ def update_macro_data():
                 GLOBAL_CACHE['be_source'] = "Lợi suất (Backup)"
                 GLOBAL_CACHE['inf10'] = {'p': res10y[0], 'c': res10y[1]}
 
+    # 5Y
     res05 = get_yahoo_data("^T5YIE")
     if res05:
         GLOBAL_CACHE['inf05'] = {'p': res05[0], 'c': res05[1]}
@@ -187,10 +192,10 @@ def send_tele(msg):
     except: pass
 
 # ==============================================================================
-# 6. ROUTING
+# 5. ROUTING
 # ==============================================================================
 @app.route('/')
-def home(): return "Bot V36 - Big VIX GVZ"
+def home(): return "Bot V35 - Full Alerts"
 
 @app.route('/run_check')
 def run_check():
@@ -199,7 +204,9 @@ def run_check():
         alerts = []
         now = time.time()
         
-        # --- CẢNH BÁO ---
+        # --- CẢNH BÁO (ĐÃ BỔ SUNG ĐỦ) ---
+        
+        # Vàng
         if gold['rsi'] > CONFIG['RSI_HIGH'] and gold['h1'] > CONFIG['RSI_PRICE_MOVE']:
             if now - last_alert_times.get('RSI', 0) > CONFIG['ALERT_COOLDOWN']:
                 alerts.append(f"🚀 <b>SIÊU TREND TĂNG:</b> RSI {gold['rsi']:.0f} + H1 chạy {gold['h1']:.1f}$")
@@ -213,17 +220,19 @@ def run_check():
                 alerts.append(f"🚨 <b>VÀNG SỐC:</b> H1 {gold['h1']:.1f} giá")
                 last_alert_times['H1'] = now
         
+        # Vĩ mô
         if macro['vix']['p'] > CONFIG['VIX_VAL_LIMIT'] or macro['vix']['pct'] > CONFIG['VIX_PCT_LIMIT']:
              if now - last_alert_times.get('VIX', 0) > CONFIG['ALERT_COOLDOWN']:
                 alerts.append(f"⚠️ <b>VIX BÁO ĐỘNG:</b> {macro['vix']['p']:.2f}")
                 last_alert_times['VIX'] = now
-        
-        # Lạm phát
+
+        # Lạm phát 10Y (0.25)
         if abs(macro['inf10']['c']) > CONFIG['INF_10Y_LIMIT']:
             if now - last_alert_times.get('INF10', 0) > CONFIG['ALERT_COOLDOWN']:
                 alerts.append(f"🇺🇸 <b>LẠM PHÁT 10Y SỐC:</b> Đổi {abs(macro['inf10']['c']):.3f} điểm")
                 last_alert_times['INF10'] = now
-        
+
+        # Lạm phát 5Y (0.20) - ĐÃ THÊM
         if abs(macro['inf05']['c']) > CONFIG['INF_05Y_LIMIT']:
             if now - last_alert_times.get('INF05', 0) > CONFIG['ALERT_COOLDOWN']:
                 alerts.append(f"🇺🇸 <b>LẠM PHÁT NGẮN HẠN:</b> Đổi {abs(macro['inf05']['c']):.3f} điểm")
@@ -233,7 +242,7 @@ def run_check():
             send_tele(f"🔥🔥 <b>CẢNH BÁO KHẨN</b> 🔥🔥\n\n" + "\n".join(alerts))
             return "Alert Sent", 200
 
-        # --- DASHBOARD (VIX/GVZ TO ĐẸP) ---
+        # DASHBOARD
         vn_now = datetime.now(pytz.timezone('Asia/Ho_Chi_Minh'))
         if vn_now.minute in [0, 1, 30, 31]:
             def s(v): return "+" if v >= 0 else ""
@@ -257,9 +266,6 @@ def run_check():
                 f"   {i(gold['c'])} {s(gold['c'])}{gold['c']:.1f}$ ({s(gold['pct'])}{gold['pct']:.2f}%)\n"
                 f"   🎯 <b>RSI (H1):</b> {gold['rsi']:.1f}\n"
                 f"-------------------------------\n"
-                f"📉 <b>VIX:</b> {fmt(macro['vix']['p'], macro['vix']['c'], macro['vix']['pct'])}\n"
-                f"🌪 <b>GVZ:</b> {fmt(macro['gvz']['p'], macro['gvz']['c'], macro['gvz']['pct'])}\n"
-                f"-------------------------------\n"
                 f"🐋 <b>SPDR Gold:</b> {spdr_txt} {spdr_chg}\n"
                 f"-------------------------------\n"
                 f"🇺🇸 <b>{macro['be_source']}:</b>\n"
@@ -268,6 +274,10 @@ def run_check():
                 f"-------------------------------\n"
                 f"🏦 <b>FedWatch ({macro['fed']['name']}):</b>\n"
                 f"   • Mức: {fmt(macro['fed']['p'], macro['fed']['c'], macro['fed']['pct'])}\n"
+                f"-------------------------------\n"
+                f"📉 <b>Risk:</b>\n"
+                f"   • VIX: {fmt(macro['vix']['p'], macro['vix']['c'], macro['vix']['pct'])}\n"
+                f"   • GVZ: {fmt(macro['gvz']['p'], macro['gvz']['c'], macro['gvz']['pct'])}\n"
             )
             send_tele(msg)
             return "Report Sent", 200
