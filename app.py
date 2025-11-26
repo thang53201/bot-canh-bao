@@ -19,10 +19,12 @@ CONFIG = {
     
     "GOLD_H1_LIMIT": 40.0,
     "RSI_HIGH": 82, "RSI_LOW": 18, "RSI_PRICE_MOVE": 30.0,
+    
     "VIX_VAL_LIMIT": 30, "VIX_PCT_LIMIT": 15.0,
     "GVZ_VAL_LIMIT": 25, "GVZ_PCT_LIMIT": 10.0,
     "INF_10Y_LIMIT": 0.25, 
     "FED_PCT_LIMIT": 15.0,
+    
     "ALERT_COOLDOWN": 3600
 }
 
@@ -41,7 +43,27 @@ GLOBAL_CACHE = {
 last_alert_times = {}
 
 # ==============================================================================
-# 2. HÀM LẤY YAHOO (3 LỚP CÔNG PHÁ)
+# 2. HÀM KIỂM TRA DỮ LIỆU (SANITY CHECK) - CHỐNG SỐ ẢO
+# ==============================================================================
+def is_valid(symbol, value):
+    """
+    Kiểm tra xem số liệu có hợp lý không.
+    Nếu quá cao hoặc quá thấp vô lý -> Loại bỏ (Return False)
+    """
+    if value is None or value == 0: return False
+    
+    # Lạm phát/Yield thường < 10% (Nếu ra 125% là sai)
+    if symbol in ['^T10YIE', '^T5YIE', '^TNX', '^FVX', '^IRX']:
+        if value > 10.0 or value < -5.0: return False
+        
+    # VIX/GVZ thường < 80 (Nếu ra 299 là sai)
+    if symbol in ['^VIX', '^GVZ']:
+        if value > 80.0 or value < 0: return False
+        
+    return True
+
+# ==============================================================================
+# 3. HÀM LẤY YAHOO (CÓ LỌC RÁC)
 # ==============================================================================
 def get_headers():
     uas = [
@@ -51,40 +73,38 @@ def get_headers():
     return {"User-Agent": random.choice(uas)}
 
 def get_yahoo_robust(symbol):
-    # CÁCH 1: API V8 JSON (Nhanh nhất)
+    val, chg, pct = None, None, None
+    
+    # CÁCH 1: API V8
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=5d"
         r = requests.get(url, headers=get_headers(), timeout=5)
         data = r.json()
         closes = [c for c in data['chart']['result'][0]['indicators']['quote'][0]['close'] if c is not None]
         if len(closes) >= 2:
-            return closes[-1], closes[-1]-closes[-2], (closes[-1]-closes[-2])/closes[-2]*100
+            val, chg, pct = closes[-1], closes[-1]-closes[-2], (closes[-1]-closes[-2])/closes[-2]*100
     except: pass
 
-    # CÁCH 2: API V7 (Dự phòng)
-    try:
-        url = f"https://query2.finance.yahoo.com/v7/finance/quote?symbols={symbol}"
-        r = requests.get(url, headers=get_headers(), timeout=5)
-        d = r.json()['quoteResponse']['result'][0]
-        return d['regularMarketPrice'], d['regularMarketChange'], d['regularMarketChangePercent']
-    except: pass
+    # CÁCH 2: CÀO HTML (Nếu cách 1 tịt)
+    if not val:
+        try:
+            url = f"https://finance.yahoo.com/quote/{symbol}"
+            r = requests.get(url, headers=get_headers(), timeout=5)
+            p = re.search(r'regularMarketPrice":{"raw":([0-9\.]+)', r.text)
+            c = re.search(r'regularMarketChange":{"raw":(-?[0-9\.]+)', r.text)
+            per = re.search(r'regularMarketChangePercent":{"raw":(-?[0-9\.]+)', r.text)
+            if p and c and per:
+                val, chg, pct = float(p.group(1)), float(c.group(1)), float(per.group(1))
+        except: pass
 
-    # CÁCH 3: CÀO HTML (Lì lợm nhất)
-    try:
-        url = f"https://finance.yahoo.com/quote/{symbol}"
-        r = requests.get(url, headers=get_headers(), timeout=5)
-        # Tìm giá bằng Regex
-        p = re.search(r'regularMarketPrice":{"raw":([0-9\.]+)', r.text)
-        c = re.search(r'regularMarketChange":{"raw":(-?[0-9\.]+)', r.text)
-        pc = re.search(r'regularMarketChangePercent":{"raw":(-?[0-9\.]+)', r.text)
-        if p and c and pc:
-            return float(p.group(1)), float(c.group(1)), float(pc.group(1))
-    except: pass
-
-    return None
+    # QUAN TRỌNG: LỌC SỐ LIỆU RÁC
+    if is_valid(symbol, val):
+        return val, chg, pct
+    else:
+        return None
 
 # ==============================================================================
-# 3. VÀNG & SPDR
+# 4. VÀNG & SPDR
 # ==============================================================================
 def get_gold_binance():
     try:
@@ -119,7 +139,7 @@ def get_spdr_smart():
     except: return None
 
 # ==============================================================================
-# 4. UPDATE LOGIC
+# 5. UPDATE LOGIC
 # ==============================================================================
 def update_macro_data():
     global GLOBAL_CACHE
@@ -135,14 +155,15 @@ def update_macro_data():
     res = get_spdr_smart()
     if res: GLOBAL_CACHE['spdr'] = {'v': res[0], 'c': res[1]}
     
-    # LẠM PHÁT (Chỉ lấy Breakeven, không lấy Yield, không lấy FRED)
+    # LẠM PHÁT (Lọc kỹ)
     res10 = get_yahoo_robust("^T10YIE")
     if res10:
         GLOBAL_CACHE['be_source'] = "Lạm phát (Breakeven)"
         GLOBAL_CACHE['inf10'] = {'p': res10[0], 'c': res10[1]}
     else:
+        # Nếu Breakeven lỗi, để N/A luôn, KHÔNG lấy Yield đắp vào nữa
         GLOBAL_CACHE['be_source'] = "Lạm phát (Chờ cập nhật...)"
-        # Giữ nguyên giá trị cũ trong cache nếu có, không ghi đè N/A
+        # Giữ nguyên giá trị cũ nếu có
 
     res05 = get_yahoo_robust("^T5YIE")
     if res05: GLOBAL_CACHE['inf05'] = {'p': res05[0], 'c': res05[1]}
@@ -168,10 +189,10 @@ def send_tele(msg):
     except: pass
 
 # ==============================================================================
-# 5. ROUTING
+# 6. ROUTING
 # ==============================================================================
 @app.route('/')
-def home(): return "Bot V46 - Realtime or Nothing"
+def home(): return "Bot V47 - Sanity Check"
 
 @app.route('/test')
 def run_test():
@@ -191,39 +212,36 @@ def run_check():
         # CẢNH BÁO
         if gold['rsi'] > CONFIG['RSI_HIGH'] and gold['h1'] > CONFIG['RSI_PRICE_MOVE']:
             if now - last_alert_times.get('RSI', 0) > CONFIG['ALERT_COOLDOWN']:
-                alerts.append(f"🚀 <b>SIÊU TREND TĂNG:</b> RSI {gold['rsi']:.0f} + H1 {gold['h1']:.1f}")
+                alerts.append(f"🚀 <b>SIÊU TREND TĂNG:</b> RSI {gold['rsi']:.0f} + H1 chạy {gold['h1']:.1f}$")
                 last_alert_times['RSI'] = now
         if gold['rsi'] < CONFIG['RSI_LOW'] and gold['h1'] > CONFIG['RSI_PRICE_MOVE']:
             if now - last_alert_times.get('RSI', 0) > CONFIG['ALERT_COOLDOWN']:
-                alerts.append(f"🩸 <b>SIÊU TREND GIẢM:</b> RSI {gold['rsi']:.0f} + H1 {gold['h1']:.1f}")
+                alerts.append(f"🩸 <b>SIÊU TREND GIẢM:</b> RSI {gold['rsi']:.0f} + H1 sập {gold['h1']:.1f}$")
                 last_alert_times['RSI'] = now
         if gold['h1'] > CONFIG['GOLD_H1_LIMIT']:
             if now - last_alert_times.get('H1', 0) > CONFIG['ALERT_COOLDOWN']:
                 alerts.append(f"🚨 <b>VÀNG SỐC:</b> H1 {gold['h1']:.1f} giá")
                 last_alert_times['H1'] = now
         
+        # VĨ MÔ (CHỈ BÁO KHI DỮ LIỆU HỢP LÝ)
         if macro['vix']['p'] > CONFIG['VIX_VAL_LIMIT'] or macro['vix']['pct'] > CONFIG['VIX_PCT_LIMIT']:
              if now - last_alert_times.get('VIX', 0) > CONFIG['ALERT_COOLDOWN']:
-                alerts.append(f"⚠️ <b>VIX BÁO ĐỘNG:</b> {macro['vix']['p']:.2f}")
-                last_alert_times['VIX'] = now
+                if macro['vix']['p'] < 100: # Check sanity
+                    alerts.append(f"⚠️ <b>VIX BÁO ĐỘNG:</b> {macro['vix']['p']:.2f}")
+                    last_alert_times['VIX'] = now
+
         if abs(macro['inf10']['c']) > CONFIG['INF_10Y_LIMIT']:
             if now - last_alert_times.get('INF10', 0) > CONFIG['ALERT_COOLDOWN']:
-                alerts.append(f"🇺🇸 <b>LẠM PHÁT SỐC:</b> Đổi {abs(macro['inf10']['c']):.3f} điểm")
-                last_alert_times['INF10'] = now
-        if abs(macro['fed']['pct']) > CONFIG['FED_PCT_LIMIT']:
-            if now - last_alert_times.get('FED', 0) > CONFIG['ALERT_COOLDOWN']:
-                alerts.append(f"🏦 <b>LÃI SUẤT BIẾN ĐỘNG:</b> Đổi {abs(macro['fed']['pct']):.1f}%")
-                last_alert_times['FED'] = now
+                if macro['inf10']['p'] < 20: # Check sanity
+                    alerts.append(f"🇺🇸 <b>LẠM PHÁT SỐC:</b> Đổi {abs(macro['inf10']['c']):.3f} điểm")
+                    last_alert_times['INF10'] = now
 
         if alerts:
             send_tele(f"🔥🔥 <b>CẢNH BÁO KHẨN</b> 🔥🔥\n\n" + "\n".join(alerts))
             return "Alert Sent", 200
 
         # DASHBOARD
-        def get_vn_time(): return datetime.utcnow() + timedelta(hours=7)
-        vn_now = get_vn_time()
-        
-        # Check khung giờ
+        vn_now = datetime.utcnow() + timedelta(hours=7)
         is_time = vn_now.minute in [0,1,2,3,4,5,30,31,32,33,34,35]
         last_sent = GLOBAL_CACHE.get('last_dashboard_time', 0)
         
