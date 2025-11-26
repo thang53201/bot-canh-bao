@@ -10,27 +10,36 @@ import pytz
 app = Flask(__name__)
 
 # ==============================================================================
-# 1. CẤU HÌNH
+# 1. CẤU HÌNH (ĐÃ CÂN NHẮC KỸ CHO DCA 150 GIÁ)
 # ==============================================================================
 CONFIG = {
     "TELEGRAM_TOKEN": "8309991075:AAFYyjFxQQ8CYECXPKeteeUBXQE3Mx2yfUo",
     "TELEGRAM_CHAT_ID": "5464507208",
     
-    "GOLD_H1_LIMIT": 40.0,
+    # --- CẢNH BÁO VÀNG (1 PHÚT) ---
+    "GOLD_H1_LIMIT": 40.0,       # Nến 40 giá mới báo
     "RSI_HIGH": 82, "RSI_LOW": 18, "RSI_PRICE_MOVE": 30.0,
-    "VIX_VAL_LIMIT": 30, "VIX_PCT_LIMIT": 15.0,
-    "GVZ_VAL_LIMIT": 25, "GVZ_PCT_LIMIT": 10.0,
-    "INF_10Y_LIMIT": 0.25, 
-    "FED_PCT_LIMIT": 15.0,
+    
+    # --- CẢNH BÁO VĨ MÔ (5 PHÚT) ---
+    "VIX_LIMIT": 33,             # VIX > 33 là hoảng loạn
+    
+    # LẠM PHÁT (Điểm số)
+    "INF_LIMIT": 0.25,           # Nguồn gốc (Breakeven): 0.25 điểm
+    "INF_PROXY_LIMIT": 0.20,     # Nguồn thay thế (Yield): 0.20 điểm (Nhạy hơn chút)
+    
+    # FEDWATCH
+    "FED_PCT_LIMIT": 15.0,       # Nguồn gốc (CME): Thay đổi 15% xác suất
+    "FED_POINT_LIMIT": 0.15,     # Nguồn thay thế (Yield): Thay đổi 0.15 điểm lãi suất
+    
     "ALERT_COOLDOWN": 3600
 }
 
 GLOBAL_CACHE = {
-    'vix': {'p': 0, 'c': 0, 'pct': 0},
-    'gvz': {'p': 0, 'c': 0, 'pct': 0},
+    'vix': {'p': 0, 'pct': 0},
+    'gvz': {'p': 0, 'pct': 0},
     'inf10': {'p': 0, 'c': 0}, 
     'inf05': {'p': 0, 'c': 0}, 
-    'fed': {'p': 0, 'pct': 0, 'name': 'Yield 13W'},
+    'fed': {'p': 0, 'c': 0, 'pct': 0, 'name': 'N/A', 'type': 'N/A'}, # Thêm type để biết nguồn
     'spdr': {'v': 0, 'c': 0},
     'be_source': 'Chờ...',
     'last_success_time': 0
@@ -39,44 +48,13 @@ GLOBAL_CACHE = {
 last_alert_times = {}
 
 # ==============================================================================
-# 2. HÀM LẤY DỮ LIỆU TỪ FRED (CỨU TINH KHI YAHOO CHẶN)
-# ==============================================================================
-def get_fred_data(series_id):
-    """
-    Lấy dữ liệu trực tiếp từ St. Louis Fed.
-    series_id: T10YIE (10Y Breakeven), T5YIE (5Y Breakeven)
-    """
-    try:
-        # URL lấy CSV của Fed
-        url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        
-        r = requests.get(url, headers=headers, timeout=10)
-        if r.status_code == 200:
-            df = pd.read_csv(io.StringIO(r.text))
-            # Lọc bỏ các ngày nghỉ lễ (ký hiệu dấu .)
-            df = df[df[series_id] != '.']
-            
-            # Chuyển cột giá trị sang số
-            df[series_id] = pd.to_numeric(df[series_id])
-            
-            if len(df) >= 2:
-                curr = float(df.iloc[-1][series_id])
-                prev = float(df.iloc[-2][series_id])
-                return curr, curr - prev
-                
-        return None
-    except Exception as e:
-        print(f"FRED Error: {e}")
-        return None
-
-# ==============================================================================
-# 3. CÁC HÀM KHÁC (GIỮ NGUYÊN TỪ V33)
+# 2. VÀNG BINANCE (REALTIME)
 # ==============================================================================
 def get_gold_binance():
     try:
         r = requests.get("https://api.binance.com/api/v3/ticker/24hr?symbol=PAXGUSDT", timeout=10)
         data = r.json()
+        
         kr = requests.get("https://api.binance.com/api/v3/klines?symbol=PAXGUSDT&interval=1h&limit=20", timeout=10)
         k_data = kr.json()
         closes = [float(x[4]) for x in k_data]
@@ -94,9 +72,17 @@ def get_gold_binance():
         last = k_data[-1]
         h1 = float(last[2]) - float(last[3])
 
-        return {'p': float(data['lastPrice']), 'c': float(data['priceChange']), 'pct': float(data['priceChangePercent']), 'h1': h1, 'rsi': curr_rsi, 'src': 'Binance'}
+        return {
+            'p': float(data['lastPrice']), 
+            'c': float(data['priceChange']), 
+            'pct': float(data['priceChangePercent']),
+            'h1': h1, 'rsi': curr_rsi, 'src': 'Binance'
+        }
     except: return None
 
+# ==============================================================================
+# 3. YAHOO MACRO (FALLBACK THÔNG MINH)
+# ==============================================================================
 def get_yahoo_data(symbol):
     try:
         uas = ['Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)']
@@ -107,6 +93,7 @@ def get_yahoo_data(symbol):
         res = data['chart']['result'][0]
         quote = res['indicators']['quote'][0]
         closes = [c for c in quote['close'] if c is not None]
+        
         if len(closes) < 2: return None
         cur = closes[-1]; prev = closes[-2]
         return cur, cur - prev, (cur - prev)/prev*100
@@ -127,7 +114,7 @@ def get_spdr_smart():
     except: return None
 
 # ==============================================================================
-# 4. UPDATE LOGIC (ƯU TIÊN FRED NẾU YAHOO CHẾT)
+# 4. UPDATE LOGIC (QUYẾT ĐỊNH LOẠI DỮ LIỆU)
 # ==============================================================================
 def update_macro_data():
     global GLOBAL_CACHE
@@ -146,35 +133,32 @@ def update_macro_data():
     res = get_spdr_smart()
     if res: GLOBAL_CACHE['spdr'] = {'v': res[0], 'c': res[1]}
     
-    # 3. LẠM PHÁT (Logic 3 lớp: Yahoo -> FRED -> Yield)
-    # Lớp 1: Yahoo
+    # 3. LẠM PHÁT
     res10 = get_yahoo_data("^T10YIE")
     if res10:
-        GLOBAL_CACHE['be_source'] = "Lạm phát (Nguồn Yahoo)"
+        GLOBAL_CACHE['be_source'] = "Lạm phát (Breakeven)"
         GLOBAL_CACHE['inf10'] = {'p': res10[0], 'c': res10[1]}
         res05 = get_yahoo_data("^T5YIE")
         if res05: GLOBAL_CACHE['inf05'] = {'p': res05[0], 'c': res05[1]}
     else:
-        # Lớp 2: FRED (Chính phủ Mỹ)
-        fred10 = get_fred_data("T10YIE")
-        if fred10:
-            GLOBAL_CACHE['be_source'] = "Lạm phát (Nguồn FRED)"
-            GLOBAL_CACHE['inf10'] = {'p': fred10[0], 'c': fred10[1]}
-            fred05 = get_fred_data("T5YIE")
-            if fred05: GLOBAL_CACHE['inf05'] = {'p': fred05[0], 'c': fred05[1]}
-        else:
-            # Lớp 3: Yield (Bất đắc dĩ mới dùng)
-            res10y = get_yahoo_data("^TNX")
-            if res10y:
-                GLOBAL_CACHE['be_source'] = "Lợi suất (Yield - Backup)"
-                GLOBAL_CACHE['inf10'] = {'p': res10y[0], 'c': res10y[1]}
-                res05y = get_yahoo_data("^FVX")
-                if res05y: GLOBAL_CACHE['inf05'] = {'p': res05y[0], 'c': res05y[1]}
+        # Fallback sang Yield
+        res10 = get_yahoo_data("^TNX")
+        if res10:
+            GLOBAL_CACHE['be_source'] = "Lợi suất (Yield - Backup)"
+            GLOBAL_CACHE['inf10'] = {'p': res10[0], 'c': res10[1]} # c là điểm số
+            res05 = get_yahoo_data("^FVX")
+            if res05: GLOBAL_CACHE['inf05'] = {'p': res05[0], 'c': res05[1]}
 
-    # 4. FEDWATCH
+    # 4. FEDWATCH (Chỉ dùng Proxy Yield 13W vì web CME chặn Bot)
     res_fed = get_yahoo_data("^IRX")
     if res_fed:
-        GLOBAL_CACHE['fed'] = {'p': res_fed[0], 'pct': res_fed[2], 'name': 'Yield 13W'}
+        GLOBAL_CACHE['fed'] = {
+            'p': res_fed[0], 
+            'c': res_fed[1],   # Thay đổi điểm (Dùng cho cảnh báo Proxy)
+            'pct': res_fed[2], # Thay đổi %
+            'name': 'Yield 13W (Proxy)',
+            'type': 'PROXY'    # Đánh dấu là hàng thay thế
+        }
     
     GLOBAL_CACHE['last_success_time'] = current_time
 
@@ -194,7 +178,7 @@ def send_tele(msg):
 # 5. ROUTING
 # ==============================================================================
 @app.route('/')
-def home(): return "Bot V34 - FRED Integration"
+def home(): return "Bot V33 - Smart Thresholds"
 
 @app.route('/run_check')
 def run_check():
@@ -203,49 +187,74 @@ def run_check():
         alerts = []
         now = time.time()
         
-        # CẢNH BÁO
+        # --- A. CẢNH BÁO VÀNG ---
         if gold['rsi'] > CONFIG['RSI_HIGH'] and gold['h1'] > CONFIG['RSI_PRICE_MOVE']:
             if now - last_alert_times.get('RSI', 0) > CONFIG['ALERT_COOLDOWN']:
-                alerts.append(f"🚀 <b>SIÊU TREND TĂNG:</b> RSI {gold['rsi']:.0f} + H1 chạy {gold['h1']:.1f}$")
+                alerts.append(f"🚀 <b>SIÊU TREND TĂNG:</b> RSI {gold['rsi']:.0f} + H1 {gold['h1']:.1f}$")
                 last_alert_times['RSI'] = now
         if gold['rsi'] < CONFIG['RSI_LOW'] and gold['h1'] > CONFIG['RSI_PRICE_MOVE']:
             if now - last_alert_times.get('RSI', 0) > CONFIG['ALERT_COOLDOWN']:
-                alerts.append(f"🩸 <b>SIÊU TREND GIẢM:</b> RSI {gold['rsi']:.0f} + H1 sập {gold['h1']:.1f}$")
+                alerts.append(f"🩸 <b>SIÊU TREND GIẢM:</b> RSI {gold['rsi']:.0f} + H1 {gold['h1']:.1f}$")
                 last_alert_times['RSI'] = now
         if gold['h1'] > CONFIG['GOLD_H1_LIMIT']:
             if now - last_alert_times.get('H1', 0) > CONFIG['ALERT_COOLDOWN']:
                 alerts.append(f"🚨 <b>VÀNG SỐC:</b> H1 {gold['h1']:.1f} giá")
                 last_alert_times['H1'] = now
         
-        if macro['vix']['p'] > CONFIG['VIX_VAL_LIMIT'] or macro['vix']['pct'] > CONFIG['VIX_PCT_LIMIT']:
+        # --- B. CẢNH BÁO VĨ MÔ ---
+        if macro['vix']['p'] > CONFIG['VIX_LIMIT']:
              if now - last_alert_times.get('VIX', 0) > CONFIG['ALERT_COOLDOWN']:
                 alerts.append(f"⚠️ <b>VIX BÁO ĐỘNG:</b> {macro['vix']['p']:.2f}")
                 last_alert_times['VIX'] = now
 
-        if abs(macro['inf10']['c']) > CONFIG['INF_10Y_LIMIT']:
+        # Check Lạm phát (Tùy nguồn mà dùng ngưỡng khác nhau)
+        inf_limit = CONFIG['INF_LIMIT'] if "Breakeven" in macro['be_source'] else CONFIG['INF_PROXY_LIMIT']
+        if abs(macro['inf10']['c']) > inf_limit:
             if now - last_alert_times.get('INF', 0) > CONFIG['ALERT_COOLDOWN']:
-                alerts.append(f"🇺🇸 <b>LẠM PHÁT SỐC:</b> Đổi {abs(macro['inf10']['c']):.3f} điểm")
+                alerts.append(f"🇺🇸 <b>LẠM PHÁT/YIELD SỐC:</b> Đổi {abs(macro['inf10']['c']):.3f} điểm")
                 last_alert_times['INF'] = now
+
+        # Check FedWatch (Dùng điểm số cho Proxy)
+        # Nếu là Proxy (Yield) -> Check điểm (0.15)
+        # Nếu là Real (CME) -> Check % (15%)
+        fed_alert = False
+        fed_val = 0
+        if macro['fed']['type'] == 'PROXY':
+            if abs(macro['fed']['c']) > CONFIG['FED_POINT_LIMIT']:
+                fed_alert = True
+                fed_val = macro['fed']['c'] # Điểm
+        else:
+            if abs(macro['fed']['c']) > CONFIG['FED_PCT_LIMIT']: # Trường hợp lấy được CME (hiếm)
+                fed_alert = True
+                fed_val = macro['fed']['c'] # Phần trăm
+
+        if fed_alert:
+            if now - last_alert_times.get('FED', 0) > CONFIG['ALERT_COOLDOWN']:
+                alerts.append(f"🏦 <b>FED WATCH BIẾN ĐỘNG:</b> {fed_val:.3f}")
+                last_alert_times['FED'] = now
 
         if alerts:
             send_tele(f"🔥🔥 <b>CẢNH BÁO KHẨN</b> 🔥🔥\n\n" + "\n".join(alerts))
             return "Alert Sent", 200
 
-        # DASHBOARD
+        # --- DASHBOARD ---
         vn_now = datetime.now(pytz.timezone('Asia/Ho_Chi_Minh'))
         if vn_now.minute in [0, 1, 30, 31]:
             def s(v): return "+" if v >= 0 else ""
             def i(v): return "🟢" if v >= 0 else "🔴"
             
-            spdr_txt = f"{macro['spdr']['v']:.2f} tấn" if macro['spdr']['v'] > 0 else "Chờ cập nhật"
+            spdr_txt = f"{macro['spdr']['v']:.2f} tấn" if macro['spdr']['v'] > 0 else "Chờ..."
             spdr_chg = f"({s(macro['spdr']['c'])}{macro['spdr']['c']:.2f})" if macro['spdr']['v'] > 0 else ""
             
             def fmt(val, chg, pct):
                 if val == 0: return "N/A"
                 return f"{val:.2f} ({s(pct)}{pct:.2f}%)"
+            
             def fmt_pts(val, chg):
                 if val == 0: return "N/A"
-                return f"{val:.3f}% (Chg: {s(chg)}{chg:.3f})" 
+                return f"{val:.3f}% (Chg: {s(chg)}{chg:.3f})"
+
+            fed_txt = f"{macro['fed']['p']:.2f}% ({s(macro['fed']['c'])}{macro['fed']['c']:.3f} điểm)"
 
             msg = (
                 f"📊 <b>MARKET DASHBOARD (D1)</b>\n"
@@ -262,7 +271,7 @@ def run_check():
                 f"   • 05Y: {fmt_pts(macro['inf05']['p'], macro['inf05']['c'])}\n"
                 f"-------------------------------\n"
                 f"🏦 <b>FedWatch ({macro['fed']['name']}):</b>\n"
-                f"   • Mức: {fmt(macro['fed']['p'], macro['fed']['c'], macro['fed']['pct'])}\n"
+                f"   • Mức: {fed_txt}\n"
                 f"-------------------------------\n"
                 f"📉 <b>Risk:</b>\n"
                 f"   • VIX: {fmt(macro['vix']['p'], macro['vix']['c'], macro['vix']['pct'])}\n"
