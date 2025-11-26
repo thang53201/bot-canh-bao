@@ -10,25 +10,17 @@ import pytz
 app = Flask(__name__)
 
 # ==============================================================================
-# 1. CẤU HÌNH (ĐẦY ĐỦ NGƯỠNG)
+# 1. CẤU HÌNH
 # ==============================================================================
 CONFIG = {
     "TELEGRAM_TOKEN": "8309991075:AAFYyjFxQQ8CYECXPKeteeUBXQE3Mx2yfUo",
     "TELEGRAM_CHAT_ID": "5464507208",
     
-    # CẢNH BÁO VÀNG (1 PHÚT)
     "GOLD_H1_LIMIT": 40.0,
     "RSI_HIGH": 82, "RSI_LOW": 18, "RSI_PRICE_MOVE": 30.0,
-    
-    # CẢNH BÁO VĨ MÔ (5 PHÚT)
     "VIX_VAL_LIMIT": 30, "VIX_PCT_LIMIT": 15.0,
     "GVZ_VAL_LIMIT": 25, "GVZ_PCT_LIMIT": 10.0,
-    
-    # LẠM PHÁT / YIELD (ĐIỂM SỐ)
-    "INF_10Y_LIMIT": 0.25,  # 10 Năm > 0.25
-    "INF_05Y_LIMIT": 0.20,  # 5 Năm (2Y) > 0.20 (Nhạy hơn)
-    
-    # FEDWATCH (%)
+    "INF_10Y_LIMIT": 0.25, "INF_05Y_LIMIT": 0.20,
     "FED_PCT_LIMIT": 15.0,
     
     "ALERT_COOLDOWN": 3600
@@ -42,13 +34,14 @@ GLOBAL_CACHE = {
     'fed': {'p': 0, 'pct': 0, 'name': 'Yield 13W'},
     'spdr': {'v': 0, 'c': 0},
     'be_source': 'Chờ...',
-    'last_success_time': 0
+    'last_success_time': 0,
+    'last_dashboard_time': 0 # Biến mới để chống gửi trùng
 }
 
 last_alert_times = {}
 
 # ==============================================================================
-# 2. HÀM LẤY DỮ LIỆU TỪ FRED (DỰ PHÒNG)
+# 2. CÁC HÀM LẤY DỮ LIỆU (GIỮ NGUYÊN)
 # ==============================================================================
 def get_fred_data(series_id):
     try:
@@ -66,9 +59,6 @@ def get_fred_data(series_id):
         return None
     except: return None
 
-# ==============================================================================
-# 3. CÁC HÀM KHÁC
-# ==============================================================================
 def get_gold_binance():
     try:
         r = requests.get("https://api.binance.com/api/v3/ticker/24hr?symbol=PAXGUSDT", timeout=10)
@@ -122,9 +112,6 @@ def get_spdr_smart():
         return None
     except: return None
 
-# ==============================================================================
-# 4. UPDATE LOGIC
-# ==============================================================================
 def update_macro_data():
     global GLOBAL_CACHE
     current_time = time.time()
@@ -132,18 +119,13 @@ def update_macro_data():
     if current_time - GLOBAL_CACHE['last_success_time'] < 300:
         return
         
-    # 1. VIX & GVZ
     res = get_yahoo_data("^VIX")
     if res: GLOBAL_CACHE['vix'] = {'p': res[0], 'c': res[1], 'pct': res[2]}
     res = get_yahoo_data("^GVZ")
     if res: GLOBAL_CACHE['gvz'] = {'p': res[0], 'c': res[1], 'pct': res[2]}
-    
-    # 2. SPDR
     res = get_spdr_smart()
     if res: GLOBAL_CACHE['spdr'] = {'v': res[0], 'c': res[1]}
     
-    # 3. LẠM PHÁT (Yahoo -> FRED -> Yield)
-    # 10Y
     res10 = get_yahoo_data("^T10YIE")
     if res10:
         GLOBAL_CACHE['be_source'] = "Lạm phát (Yahoo)"
@@ -159,7 +141,6 @@ def update_macro_data():
                 GLOBAL_CACHE['be_source'] = "Lợi suất (Backup)"
                 GLOBAL_CACHE['inf10'] = {'p': res10y[0], 'c': res10y[1]}
 
-    # 5Y
     res05 = get_yahoo_data("^T5YIE")
     if res05:
         GLOBAL_CACHE['inf05'] = {'p': res05[0], 'c': res05[1]}
@@ -172,7 +153,6 @@ def update_macro_data():
             if res05y:
                 GLOBAL_CACHE['inf05'] = {'p': res05y[0], 'c': res05y[1]}
 
-    # 4. FEDWATCH
     res_fed = get_yahoo_data("^IRX")
     if res_fed:
         GLOBAL_CACHE['fed'] = {'p': res_fed[0], 'pct': res_fed[2], 'name': 'Yield 13W'}
@@ -192,10 +172,18 @@ def send_tele(msg):
     except: pass
 
 # ==============================================================================
-# 5. ROUTING
+# 4. ROUTING
 # ==============================================================================
 @app.route('/')
-def home(): return "Bot V35 - Full Alerts"
+def home(): return "Bot V36 - Sleep Fix"
+
+@app.route('/test')
+def run_test():
+    try:
+        gold, _ = get_data_final()
+        send_tele(f"🔔 <b>TEST:</b> Bot OK. Gold: {gold['p']}")
+        return "OK", 200
+    except Exception as e: return f"Err: {e}", 500
 
 @app.route('/run_check')
 def run_check():
@@ -204,9 +192,7 @@ def run_check():
         alerts = []
         now = time.time()
         
-        # --- CẢNH BÁO (ĐÃ BỔ SUNG ĐỦ) ---
-        
-        # Vàng
+        # CẢNH BÁO
         if gold['rsi'] > CONFIG['RSI_HIGH'] and gold['h1'] > CONFIG['RSI_PRICE_MOVE']:
             if now - last_alert_times.get('RSI', 0) > CONFIG['ALERT_COOLDOWN']:
                 alerts.append(f"🚀 <b>SIÊU TREND TĂNG:</b> RSI {gold['rsi']:.0f} + H1 chạy {gold['h1']:.1f}$")
@@ -220,43 +206,44 @@ def run_check():
                 alerts.append(f"🚨 <b>VÀNG SỐC:</b> H1 {gold['h1']:.1f} giá")
                 last_alert_times['H1'] = now
         
-        # Vĩ mô
         if macro['vix']['p'] > CONFIG['VIX_VAL_LIMIT'] or macro['vix']['pct'] > CONFIG['VIX_PCT_LIMIT']:
              if now - last_alert_times.get('VIX', 0) > CONFIG['ALERT_COOLDOWN']:
                 alerts.append(f"⚠️ <b>VIX BÁO ĐỘNG:</b> {macro['vix']['p']:.2f}")
                 last_alert_times['VIX'] = now
-
-        # Lạm phát 10Y (0.25)
         if abs(macro['inf10']['c']) > CONFIG['INF_10Y_LIMIT']:
             if now - last_alert_times.get('INF10', 0) > CONFIG['ALERT_COOLDOWN']:
                 alerts.append(f"🇺🇸 <b>LẠM PHÁT 10Y SỐC:</b> Đổi {abs(macro['inf10']['c']):.3f} điểm")
                 last_alert_times['INF10'] = now
-
-        # Lạm phát 5Y (0.20) - ĐÃ THÊM
         if abs(macro['inf05']['c']) > CONFIG['INF_05Y_LIMIT']:
             if now - last_alert_times.get('INF05', 0) > CONFIG['ALERT_COOLDOWN']:
                 alerts.append(f"🇺🇸 <b>LẠM PHÁT NGẮN HẠN:</b> Đổi {abs(macro['inf05']['c']):.3f} điểm")
                 last_alert_times['INF05'] = now
+        if abs(macro['fed']['pct']) > CONFIG['FED_PCT_LIMIT']:
+            if now - last_alert_times.get('FED', 0) > CONFIG['ALERT_COOLDOWN']:
+                alerts.append(f"🏦 <b>FED WATCH BIẾN ĐỘNG:</b> Đổi {abs(macro['fed']['pct']):.1f}%")
+                last_alert_times['FED'] = now
 
         if alerts:
             send_tele(f"🔥🔥 <b>CẢNH BÁO KHẨN</b> 🔥🔥\n\n" + "\n".join(alerts))
             return "Alert Sent", 200
 
-        # DASHBOARD
+        # --- DASHBOARD (LOGIC MỚI: MỞ RỘNG KHUNG GIỜ) ---
         vn_now = datetime.now(pytz.timezone('Asia/Ho_Chi_Minh'))
-        if vn_now.minute in [0, 1, 30, 31]:
+        
+        # Kiểm tra xem đã gửi dashboard trong 20 phút gần đây chưa
+        # Nếu chưa VÀ phút hiện tại nằm trong khoảng 0-5 hoặc 30-35 --> GỬI
+        is_dashboard_time = vn_now.minute in [0, 1, 2, 3, 4, 5, 30, 31, 32, 33, 34, 35]
+        last_sent = GLOBAL_CACHE.get('last_dashboard_time', 0)
+        
+        if is_dashboard_time and (now - last_sent > 1200): # 1200s = 20 phút (Đảm bảo không gửi trùng)
             def s(v): return "+" if v >= 0 else ""
             def i(v): return "🟢" if v >= 0 else "🔴"
             
             spdr_txt = f"{macro['spdr']['v']:.2f} tấn" if macro['spdr']['v'] > 0 else "Chờ cập nhật"
             spdr_chg = f"({s(macro['spdr']['c'])}{macro['spdr']['c']:.2f})" if macro['spdr']['v'] > 0 else ""
             
-            def fmt(val, chg, pct):
-                if val == 0: return "N/A"
-                return f"{val:.2f} ({s(pct)}{pct:.2f}%)"
-            def fmt_pts(val, chg):
-                if val == 0: return "N/A"
-                return f"{val:.3f}% (Chg: {s(chg)}{chg:.3f})" 
+            def fmt(val, chg, pct): return f"{val:.2f} ({s(pct)}{pct:.2f}%)" if val else "N/A"
+            def fmt_pts(val, chg): return f"{val:.3f}% (Chg: {s(chg)}{chg:.3f})" if val else "N/A"
 
             msg = (
                 f"📊 <b>MARKET DASHBOARD (D1)</b>\n"
@@ -280,6 +267,9 @@ def run_check():
                 f"   • GVZ: {fmt(macro['gvz']['p'], macro['gvz']['c'], macro['gvz']['pct'])}\n"
             )
             send_tele(msg)
+            
+            # Cập nhật thời gian đã gửi
+            GLOBAL_CACHE['last_dashboard_time'] = now
             return "Report Sent", 200
 
         return "Checked", 200
