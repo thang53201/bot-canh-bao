@@ -19,12 +19,10 @@ CONFIG = {
     
     "GOLD_H1_LIMIT": 40.0,
     "RSI_HIGH": 82, "RSI_LOW": 18, "RSI_PRICE_MOVE": 30.0,
-    
     "VIX_VAL_LIMIT": 30, "VIX_PCT_LIMIT": 15.0,
     "GVZ_VAL_LIMIT": 25, "GVZ_PCT_LIMIT": 10.0,
     "INF_10Y_LIMIT": 0.25, 
     "FED_PCT_LIMIT": 15.0,
-    
     "ALERT_COOLDOWN": 3600
 }
 
@@ -33,7 +31,7 @@ GLOBAL_CACHE = {
     'gvz': {'p': 0, 'c': 0, 'pct': 0},
     'inf10': {'p': 0, 'c': 0}, 
     'inf05': {'p': 0, 'c': 0}, 
-    'fed': {'p': 0, 'pct': 0, 'name': 'Lãi suất TT (Proxy)'},
+    'fed': {'p': 0, 'pct': 0, 'name': 'Yield 13W (Proxy)'},
     'spdr': {'v': 0, 'c': 0},
     'be_source': 'Chờ...',
     'last_success_time': 0,
@@ -43,53 +41,47 @@ GLOBAL_CACHE = {
 last_alert_times = {}
 
 # ==============================================================================
-# 2. HÀM KIỂM TRA DỮ LIỆU (SANITY CHECK) - CHỐNG SỐ ẢO
+# 2. BỘ LỌC DỮ LIỆU RÁC (QUAN TRỌNG NHẤT BẢN NÀY)
 # ==============================================================================
-def is_valid(symbol, value):
+def is_sane(symbol, value):
     """
-    Kiểm tra xem số liệu có hợp lý không.
-    Nếu quá cao hoặc quá thấp vô lý -> Loại bỏ (Return False)
+    Kiểm tra xem con số có 'điên' không.
+    Nếu số liệu quá vô lý so với thực tế thị trường -> Trả về False (Rác).
     """
     if value is None or value == 0: return False
     
-    # Lạm phát/Yield thường < 10% (Nếu ra 125% là sai)
+    # Lạm phát/Yield Mỹ: Không bao giờ vượt quá 10% trong điều kiện hiện nay
     if symbol in ['^T10YIE', '^T5YIE', '^TNX', '^FVX', '^IRX']:
         if value > 10.0 or value < -5.0: return False
         
-    # VIX/GVZ thường < 80 (Nếu ra 299 là sai)
+    # VIX/GVZ: Mức kỷ lục lịch sử là ~89. Nếu > 90 là số ảo.
     if symbol in ['^VIX', '^GVZ']:
-        if value > 80.0 or value < 0: return False
+        if value > 90.0 or value < 0: return False
         
     return True
 
 # ==============================================================================
-# 3. HÀM LẤY YAHOO (CÓ LỌC RÁC)
+# 3. HÀM LẤY DATA (CÓ ÁP DỤNG BỘ LỌC)
 # ==============================================================================
-def get_headers():
-    uas = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15"
-    ]
-    return {"User-Agent": random.choice(uas)}
-
 def get_yahoo_robust(symbol):
     val, chg, pct = None, None, None
     
-    # CÁCH 1: API V8
+    # CÁCH 1: API JSON (Ưu tiên)
     try:
+        headers = {"User-Agent": "Mozilla/5.0"}
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=5d"
-        r = requests.get(url, headers=get_headers(), timeout=5)
+        r = requests.get(url, headers=headers, timeout=5)
         data = r.json()
         closes = [c for c in data['chart']['result'][0]['indicators']['quote'][0]['close'] if c is not None]
         if len(closes) >= 2:
             val, chg, pct = closes[-1], closes[-1]-closes[-2], (closes[-1]-closes[-2])/closes[-2]*100
     except: pass
 
-    # CÁCH 2: CÀO HTML (Nếu cách 1 tịt)
+    # CÁCH 2: HTML REGEX (Dự phòng)
     if not val:
         try:
             url = f"https://finance.yahoo.com/quote/{symbol}"
-            r = requests.get(url, headers=get_headers(), timeout=5)
+            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
             p = re.search(r'regularMarketPrice":{"raw":([0-9\.]+)', r.text)
             c = re.search(r'regularMarketChange":{"raw":(-?[0-9\.]+)', r.text)
             per = re.search(r'regularMarketChangePercent":{"raw":(-?[0-9\.]+)', r.text)
@@ -97,21 +89,18 @@ def get_yahoo_robust(symbol):
                 val, chg, pct = float(p.group(1)), float(c.group(1)), float(per.group(1))
         except: pass
 
-    # QUAN TRỌNG: LỌC SỐ LIỆU RÁC
-    if is_valid(symbol, val):
+    # KIỂM TRA HỢP LÝ: Nếu số liệu "điên" -> Trả về None ngay
+    if is_sane(symbol, val):
         return val, chg, pct
     else:
         return None
 
-# ==============================================================================
-# 4. VÀNG & SPDR
-# ==============================================================================
 def get_gold_binance():
     try:
         r = requests.get("https://api.binance.com/api/v3/ticker/24hr?symbol=PAXGUSDT", timeout=5)
         d = r.json()
-        kr = requests.get("https://api.binance.com/api/v3/klines?symbol=PAXGUSDT&interval=1h&limit=20", timeout=5)
-        kd = kr.json()
+        k = requests.get("https://api.binance.com/api/v3/klines?symbol=PAXGUSDT&interval=1h&limit=20", timeout=5)
+        kd = k.json()
         closes = [float(x[4]) for x in kd]
         if len(closes) >= 15:
             delta = pd.Series(closes).diff()
@@ -139,7 +128,7 @@ def get_spdr_smart():
     except: return None
 
 # ==============================================================================
-# 5. UPDATE LOGIC
+# 4. UPDATE LOGIC
 # ==============================================================================
 def update_macro_data():
     global GLOBAL_CACHE
@@ -147,7 +136,7 @@ def update_macro_data():
     
     if current_time - GLOBAL_CACHE['last_success_time'] < 300: return
 
-    # VIX/GVZ/SPDR
+    # VIX & GVZ
     res = get_yahoo_robust("^VIX")
     if res: GLOBAL_CACHE['vix'] = {'p': res[0], 'c': res[1], 'pct': res[2]}
     res = get_yahoo_robust("^GVZ")
@@ -155,15 +144,14 @@ def update_macro_data():
     res = get_spdr_smart()
     if res: GLOBAL_CACHE['spdr'] = {'v': res[0], 'c': res[1]}
     
-    # LẠM PHÁT (Lọc kỹ)
+    # LẠM PHÁT (Chỉ lấy Breakeven chuẩn, nếu lỗi thì N/A)
     res10 = get_yahoo_robust("^T10YIE")
     if res10:
         GLOBAL_CACHE['be_source'] = "Lạm phát (Breakeven)"
         GLOBAL_CACHE['inf10'] = {'p': res10[0], 'c': res10[1]}
     else:
-        # Nếu Breakeven lỗi, để N/A luôn, KHÔNG lấy Yield đắp vào nữa
-        GLOBAL_CACHE['be_source'] = "Lạm phát (Chờ cập nhật...)"
-        # Giữ nguyên giá trị cũ nếu có
+        GLOBAL_CACHE['be_source'] = "Lạm phát (Chờ cập nhật)"
+        # Không ghi đè nếu lỗi, giữ cache cũ
 
     res05 = get_yahoo_robust("^T5YIE")
     if res05: GLOBAL_CACHE['inf05'] = {'p': res05[0], 'c': res05[1]}
@@ -171,7 +159,7 @@ def update_macro_data():
     # FEDWATCH (Proxy ^IRX)
     res_fed = get_yahoo_robust("^IRX")
     if res_fed:
-        GLOBAL_CACHE['fed'] = {'p': res_fed[0], 'pct': res_fed[2], 'name': 'Lãi suất TT (Proxy)'}
+        GLOBAL_CACHE['fed'] = {'p': res_fed[0], 'pct': res_fed[2], 'name': 'Yield 13W (Proxy)'}
     
     GLOBAL_CACHE['last_success_time'] = current_time
 
@@ -189,10 +177,10 @@ def send_tele(msg):
     except: pass
 
 # ==============================================================================
-# 6. ROUTING
+# 5. ROUTING & CHECK
 # ==============================================================================
 @app.route('/')
-def home(): return "Bot V47 - Sanity Check"
+def home(): return "Bot V48 - Sanity Check Added"
 
 @app.route('/test')
 def run_test():
@@ -223,18 +211,16 @@ def run_check():
                 alerts.append(f"🚨 <b>VÀNG SỐC:</b> H1 {gold['h1']:.1f} giá")
                 last_alert_times['H1'] = now
         
-        # VĨ MÔ (CHỈ BÁO KHI DỮ LIỆU HỢP LÝ)
-        if macro['vix']['p'] > CONFIG['VIX_VAL_LIMIT'] or macro['vix']['pct'] > CONFIG['VIX_PCT_LIMIT']:
+        # CHỈ CẢNH BÁO VĨ MÔ NẾU DỮ LIỆU HỢP LÝ ( < 100 )
+        if macro['vix']['p'] > CONFIG['VIX_VAL_LIMIT'] and macro['vix']['p'] < 90:
              if now - last_alert_times.get('VIX', 0) > CONFIG['ALERT_COOLDOWN']:
-                if macro['vix']['p'] < 100: # Check sanity
-                    alerts.append(f"⚠️ <b>VIX BÁO ĐỘNG:</b> {macro['vix']['p']:.2f}")
-                    last_alert_times['VIX'] = now
+                alerts.append(f"⚠️ <b>VIX BÁO ĐỘNG:</b> {macro['vix']['p']:.2f}")
+                last_alert_times['VIX'] = now
 
-        if abs(macro['inf10']['c']) > CONFIG['INF_10Y_LIMIT']:
+        if abs(macro['inf10']['c']) > CONFIG['INF_10Y_LIMIT'] and macro['inf10']['p'] < 20:
             if now - last_alert_times.get('INF10', 0) > CONFIG['ALERT_COOLDOWN']:
-                if macro['inf10']['p'] < 20: # Check sanity
-                    alerts.append(f"🇺🇸 <b>LẠM PHÁT SỐC:</b> Đổi {abs(macro['inf10']['c']):.3f} điểm")
-                    last_alert_times['INF10'] = now
+                alerts.append(f"🇺🇸 <b>LẠM PHÁT SỐC:</b> Đổi {abs(macro['inf10']['c']):.3f} điểm")
+                last_alert_times['INF10'] = now
 
         if alerts:
             send_tele(f"🔥🔥 <b>CẢNH BÁO KHẨN</b> 🔥🔥\n\n" + "\n".join(alerts))
@@ -242,8 +228,8 @@ def run_check():
 
         # DASHBOARD
         vn_now = datetime.utcnow() + timedelta(hours=7)
-        is_time = vn_now.minute in [0,1,2,3,4,5,30,31,32,33,34,35]
         last_sent = GLOBAL_CACHE.get('last_dashboard_time', 0)
+        is_time = vn_now.minute in [0,1,2,3,4,5,30,31,32,33,34,35]
         
         if is_time and (now - last_sent > 1200):
             def s(v): return "+" if v >= 0 else ""
