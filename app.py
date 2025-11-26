@@ -37,36 +37,25 @@ GLOBAL_CACHE = {
 
 last_alert_times = {}
 
-# ==============================================================================
-# 2. HÀM LẤY GIỜ VIỆT NAM (CHUẨN UTC+7)
-# ==============================================================================
 def get_vn_time():
-    # Lấy giờ UTC gốc của server + 7 tiếng
     return datetime.utcnow() + timedelta(hours=7)
 
-# ==============================================================================
-# 3. CÁC HÀM LẤY DỮ LIỆU
-# ==============================================================================
-def get_fred_data(series_id):
+def send_tele(msg):
     try:
-        url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        r = requests.get(url, headers=headers, timeout=5) # Giảm timeout
-        if r.status_code == 200:
-            df = pd.read_csv(io.StringIO(r.text))
-            df = df[df[series_id] != '.']
-            df[series_id] = pd.to_numeric(df[series_id])
-            if len(df) >= 2:
-                curr = float(df.iloc[-1][series_id])
-                prev = float(df.iloc[-2][series_id])
-                return curr, curr - prev
-        return None
-    except: return None
+        # Timeout cực ngắn (5s) để không làm treo Bot
+        requests.post(f"https://api.telegram.org/bot{CONFIG['TELEGRAM_TOKEN']}/sendMessage", 
+                      json={"chat_id": CONFIG['TELEGRAM_CHAT_ID'], "text": msg, "parse_mode": "HTML"}, timeout=5)
+    except: pass
 
+# ==============================================================================
+# 2. HÀM LẤY VÀNG (NHANH GỌN - KHÔNG RETRY DÀI DÒNG)
+# ==============================================================================
 def get_gold_binance():
     try:
+        # Timeout 5s: Nếu mạng lag quá 5s thì bỏ qua luôn để giữ mạng sống cho Bot
         r = requests.get("https://api.binance.com/api/v3/ticker/24hr?symbol=PAXGUSDT", timeout=5)
         data = r.json()
+        
         kr = requests.get("https://api.binance.com/api/v3/klines?symbol=PAXGUSDT&interval=1h&limit=20", timeout=5)
         k_data = kr.json()
         closes = [float(x[4]) for x in k_data]
@@ -87,19 +76,33 @@ def get_gold_binance():
         return {'p': float(data['lastPrice']), 'c': float(data['priceChange']), 'pct': float(data['priceChangePercent']), 'h1': h1, 'rsi': curr_rsi, 'src': 'Binance'}
     except: return None
 
+# ==============================================================================
+# 3. MACRO (CẬP NHẬT NHANH)
+# ==============================================================================
 def get_yahoo_data(symbol):
     try:
-        uas = ['Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)']
-        headers = {"User-Agent": random.choice(uas)}
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=5d"
-        r = requests.get(url, headers=headers, timeout=5)
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=4) # Timeout ngắn
         data = r.json()
-        res = data['chart']['result'][0]
-        quote = res['indicators']['quote'][0]
-        closes = [c for c in quote['close'] if c is not None]
+        closes = [c for c in data['chart']['result'][0]['indicators']['quote'][0]['close'] if c is not None]
         if len(closes) < 2: return None
         cur = closes[-1]; prev = closes[-2]
         return cur, cur - prev, (cur - prev)/prev*100
+    except: return None
+
+def get_fred_data(series_id):
+    try:
+        url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=4)
+        if r.status_code == 200:
+            df = pd.read_csv(io.StringIO(r.text))
+            df = df[df[series_id] != '.']
+            df[series_id] = pd.to_numeric(df[series_id])
+            if len(df) >= 2:
+                curr = float(df.iloc[-1][series_id])
+                prev = float(df.iloc[-2][series_id])
+                return curr, curr - prev
+        return None
     except: return None
 
 def get_spdr_smart():
@@ -120,81 +123,75 @@ def update_macro_data():
     global GLOBAL_CACHE
     current_time = time.time()
     
-    # 5 phút (300s) cập nhật 1 lần
+    # Vẫn giữ 5 phút cập nhật 1 lần
     if current_time - GLOBAL_CACHE['last_success_time'] < 300:
         return
+
+    # Cập nhật từng món (Fail thì bỏ qua luôn, không retry)
+    try:
+        # VIX & GVZ
+        res = get_yahoo_data("^VIX")
+        if res: GLOBAL_CACHE['vix'] = {'p': res[0], 'c': res[1], 'pct': res[2]}
+        res = get_yahoo_data("^GVZ")
+        if res: GLOBAL_CACHE['gvz'] = {'p': res[0], 'c': res[1], 'pct': res[2]}
         
-    res = get_yahoo_data("^VIX")
-    if res: GLOBAL_CACHE['vix'] = {'p': res[0], 'c': res[1], 'pct': res[2]}
-    res = get_yahoo_data("^GVZ")
-    if res: GLOBAL_CACHE['gvz'] = {'p': res[0], 'c': res[1], 'pct': res[2]}
-    res = get_spdr_smart()
-    if res: GLOBAL_CACHE['spdr'] = {'v': res[0], 'c': res[1]}
-    
-    res10 = get_yahoo_data("^T10YIE")
-    if res10:
-        GLOBAL_CACHE['be_source'] = "Lạm phát (Yahoo)"
-        GLOBAL_CACHE['inf10'] = {'p': res10[0], 'c': res10[1]}
-    else:
-        fred10 = get_fred_data("T10YIE")
-        if fred10:
-            GLOBAL_CACHE['be_source'] = "Lạm phát (FRED)"
-            GLOBAL_CACHE['inf10'] = {'p': fred10[0], 'c': fred10[1]}
+        # SPDR
+        res = get_spdr_smart()
+        if res: GLOBAL_CACHE['spdr'] = {'v': res[0], 'c': res[1]}
+        
+        # Lạm phát & Fed
+        res10 = get_yahoo_data("^T10YIE")
+        if res10:
+            GLOBAL_CACHE['be_source'] = "Lạm phát (Yahoo)"
+            GLOBAL_CACHE['inf10'] = {'p': res10[0], 'c': res10[1]}
         else:
-            res10y = get_yahoo_data("^TNX")
-            if res10y:
-                GLOBAL_CACHE['be_source'] = "Lợi suất (Backup)"
-                GLOBAL_CACHE['inf10'] = {'p': res10y[0], 'c': res10y[1]}
+            fred10 = get_fred_data("T10YIE")
+            if fred10:
+                GLOBAL_CACHE['be_source'] = "Lạm phát (FRED)"
+                GLOBAL_CACHE['inf10'] = {'p': fred10[0], 'c': fred10[1]}
+            else:
+                res10y = get_yahoo_data("^TNX")
+                if res10y:
+                    GLOBAL_CACHE['be_source'] = "Lợi suất (Backup)"
+                    GLOBAL_CACHE['inf10'] = {'p': res10y[0], 'c': res10y[1]}
 
-    res05 = get_yahoo_data("^T5YIE")
-    if res05:
-        GLOBAL_CACHE['inf05'] = {'p': res05[0], 'c': res05[1]}
-    else:
-        fred05 = get_fred_data("T5YIE")
-        if fred05:
-            GLOBAL_CACHE['inf05'] = {'p': fred05[0], 'c': fred05[1]}
+        res05 = get_yahoo_data("^T5YIE")
+        if res05: GLOBAL_CACHE['inf05'] = {'p': res05[0], 'c': res05[1]}
         else:
-            res05y = get_yahoo_data("^FVX")
-            if res05y:
-                GLOBAL_CACHE['inf05'] = {'p': res05y[0], 'c': res05y[1]}
+            fred05 = get_fred_data("T5YIE")
+            if fred05: GLOBAL_CACHE['inf05'] = {'p': fred05[0], 'c': fred05[1]}
+            else:
+                res05y = get_yahoo_data("^FVX")
+                if res05y: GLOBAL_CACHE['inf05'] = {'p': res05y[0], 'c': res05y[1]}
 
-    res_fed = get_yahoo_data("^IRX")
-    if res_fed:
-        GLOBAL_CACHE['fed'] = {'p': res_fed[0], 'pct': res_fed[2], 'name': 'Yield 13W'}
-    
-    GLOBAL_CACHE['last_success_time'] = current_time
+        res_fed = get_yahoo_data("^IRX")
+        if res_fed: GLOBAL_CACHE['fed'] = {'p': res_fed[0], 'pct': res_fed[2], 'name': 'Yield 13W'}
+        
+        GLOBAL_CACHE['last_success_time'] = current_time
+    except: pass # Nếu lỗi thì bỏ qua, dùng cache cũ
 
 def get_data_final():
     gold = get_gold_binance()
     if not gold: gold = {'p': 0, 'c': 0, 'pct': 0, 'h1': 0, 'rsi': 50, 'src': 'Mất kết nối'}
-    update_macro_data()
+    
+    # Chạy update macro trong try-except để không bao giờ làm chết bot
+    try: update_macro_data()
+    except: pass
+    
     return gold, GLOBAL_CACHE
 
-def send_tele(msg):
-    try:
-        requests.post(f"https://api.telegram.org/bot{CONFIG['TELEGRAM_TOKEN']}/sendMessage", 
-                      json={"chat_id": CONFIG['TELEGRAM_CHAT_ID'], "text": msg, "parse_mode": "HTML"}, timeout=5)
-    except: pass
-
 # ==============================================================================
-# 4. ROUTING & TEST (DEBUG THỜI GIAN)
+# 4. ROUTING
 # ==============================================================================
 @app.route('/')
-def home(): return "Bot V38 - Time Debug"
+def home(): return "Bot V40 - Light & Fast"
 
 @app.route('/test')
 def run_test():
     try:
-        vn_now = get_vn_time() # Lấy giờ VN
         gold, _ = get_data_final()
-        
-        msg = (
-            f"🔔 <b>TEST KẾT NỐI</b>\n"
-            f"🕒 Giờ Server (VN): {vn_now.strftime('%H:%M:%S')}\n"
-            f"👉 Nếu giờ này sai, bảng tin sẽ không gửi.\n"
-            f"🥇 Gold: {gold['p']}"
-        )
-        send_tele(msg)
+        vn_now = get_vn_time()
+        send_tele(f"🔔 <b>TEST OK</b>\nGiờ Server: {vn_now.strftime('%H:%M:%S')}\n🥇 Gold: {gold['p']}")
         return "OK", 200
     except Exception as e: return f"Err: {e}", 500
 
@@ -241,13 +238,12 @@ def run_check():
             return "Alert Sent", 200
 
         # DASHBOARD
-        vn_now = get_vn_time() # Dùng hàm tính giờ chuẩn
-        
-        # Cho phép gửi trong khoảng 10 phút đầu (0-10 và 30-40) để tránh miss khi server lag
-        is_time = vn_now.minute in [0,1,2,3,4,5,6,7,8,9,10,30,31,32,33,34,35,36,37,38,39,40]
+        vn_now = get_vn_time()
+        # Mở rộng khung giờ gửi từ 0-5 và 30-35
+        is_dashboard_time = vn_now.minute in [0, 1, 2, 3, 4, 5, 30, 31, 32, 33, 34, 35]
         last_sent = GLOBAL_CACHE.get('last_dashboard_time', 0)
         
-        if is_time and (now - last_sent > 1200): # Cách nhau ít nhất 20p
+        if is_dashboard_time and (now - last_sent > 1200):
             def s(v): return "+" if v >= 0 else ""
             def i(v): return "🟢" if v >= 0 else "🔴"
             
@@ -284,8 +280,7 @@ def run_check():
 
         return "Checked", 200
     except Exception as e:
-        print(f"Err: {e}")
-        return "Error", 200
+        return f"Error: {e}", 200
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
