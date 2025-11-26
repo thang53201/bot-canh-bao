@@ -4,8 +4,7 @@ import pandas as pd
 import io
 import time
 import random
-from datetime import datetime
-import pytz
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
@@ -15,14 +14,12 @@ app = Flask(__name__)
 CONFIG = {
     "TELEGRAM_TOKEN": "8309991075:AAFYyjFxQQ8CYECXPKeteeUBXQE3Mx2yfUo",
     "TELEGRAM_CHAT_ID": "5464507208",
-    
     "GOLD_H1_LIMIT": 40.0,
     "RSI_HIGH": 82, "RSI_LOW": 18, "RSI_PRICE_MOVE": 30.0,
     "VIX_VAL_LIMIT": 30, "VIX_PCT_LIMIT": 15.0,
     "GVZ_VAL_LIMIT": 25, "GVZ_PCT_LIMIT": 10.0,
     "INF_10Y_LIMIT": 0.25, "INF_05Y_LIMIT": 0.20,
     "FED_PCT_LIMIT": 15.0,
-    
     "ALERT_COOLDOWN": 3600
 }
 
@@ -35,19 +32,26 @@ GLOBAL_CACHE = {
     'spdr': {'v': 0, 'c': 0},
     'be_source': 'Chờ...',
     'last_success_time': 0,
-    'last_dashboard_time': 0 # Biến mới để chống gửi trùng
+    'last_dashboard_time': 0
 }
 
 last_alert_times = {}
 
 # ==============================================================================
-# 2. CÁC HÀM LẤY DỮ LIỆU (GIỮ NGUYÊN)
+# 2. HÀM LẤY GIỜ VIỆT NAM (CHUẨN UTC+7)
+# ==============================================================================
+def get_vn_time():
+    # Lấy giờ UTC gốc của server + 7 tiếng
+    return datetime.utcnow() + timedelta(hours=7)
+
+# ==============================================================================
+# 3. CÁC HÀM LẤY DỮ LIỆU
 # ==============================================================================
 def get_fred_data(series_id):
     try:
         url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
         headers = {"User-Agent": "Mozilla/5.0"}
-        r = requests.get(url, headers=headers, timeout=10)
+        r = requests.get(url, headers=headers, timeout=5) # Giảm timeout
         if r.status_code == 200:
             df = pd.read_csv(io.StringIO(r.text))
             df = df[df[series_id] != '.']
@@ -61,9 +65,9 @@ def get_fred_data(series_id):
 
 def get_gold_binance():
     try:
-        r = requests.get("https://api.binance.com/api/v3/ticker/24hr?symbol=PAXGUSDT", timeout=10)
+        r = requests.get("https://api.binance.com/api/v3/ticker/24hr?symbol=PAXGUSDT", timeout=5)
         data = r.json()
-        kr = requests.get("https://api.binance.com/api/v3/klines?symbol=PAXGUSDT&interval=1h&limit=20", timeout=10)
+        kr = requests.get("https://api.binance.com/api/v3/klines?symbol=PAXGUSDT&interval=1h&limit=20", timeout=5)
         k_data = kr.json()
         closes = [float(x[4]) for x in k_data]
         
@@ -88,7 +92,7 @@ def get_yahoo_data(symbol):
         uas = ['Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)']
         headers = {"User-Agent": random.choice(uas)}
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=5d"
-        r = requests.get(url, headers=headers, timeout=10)
+        r = requests.get(url, headers=headers, timeout=5)
         data = r.json()
         res = data['chart']['result'][0]
         quote = res['indicators']['quote'][0]
@@ -101,7 +105,7 @@ def get_yahoo_data(symbol):
 def get_spdr_smart():
     try:
         url = "https://www.spdrgoldshares.com/assets/dynamic/GLD/GLD_US_archive_EN.csv"
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10, verify=False)
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5, verify=False)
         if r.status_code == 200:
             df = pd.read_csv(io.StringIO(r.text), skiprows=6)
             col = [c for c in df.columns if "Tonnes" in str(c)]
@@ -116,6 +120,7 @@ def update_macro_data():
     global GLOBAL_CACHE
     current_time = time.time()
     
+    # 5 phút (300s) cập nhật 1 lần
     if current_time - GLOBAL_CACHE['last_success_time'] < 300:
         return
         
@@ -168,20 +173,28 @@ def get_data_final():
 def send_tele(msg):
     try:
         requests.post(f"https://api.telegram.org/bot{CONFIG['TELEGRAM_TOKEN']}/sendMessage", 
-                      json={"chat_id": CONFIG['TELEGRAM_CHAT_ID'], "text": msg, "parse_mode": "HTML"})
+                      json={"chat_id": CONFIG['TELEGRAM_CHAT_ID'], "text": msg, "parse_mode": "HTML"}, timeout=5)
     except: pass
 
 # ==============================================================================
-# 4. ROUTING
+# 4. ROUTING & TEST (DEBUG THỜI GIAN)
 # ==============================================================================
 @app.route('/')
-def home(): return "Bot V36 - Sleep Fix"
+def home(): return "Bot V38 - Time Debug"
 
 @app.route('/test')
 def run_test():
     try:
+        vn_now = get_vn_time() # Lấy giờ VN
         gold, _ = get_data_final()
-        send_tele(f"🔔 <b>TEST:</b> Bot OK. Gold: {gold['p']}")
+        
+        msg = (
+            f"🔔 <b>TEST KẾT NỐI</b>\n"
+            f"🕒 Giờ Server (VN): {vn_now.strftime('%H:%M:%S')}\n"
+            f"👉 Nếu giờ này sai, bảng tin sẽ không gửi.\n"
+            f"🥇 Gold: {gold['p']}"
+        )
+        send_tele(msg)
         return "OK", 200
     except Exception as e: return f"Err: {e}", 500
 
@@ -227,15 +240,14 @@ def run_check():
             send_tele(f"🔥🔥 <b>CẢNH BÁO KHẨN</b> 🔥🔥\n\n" + "\n".join(alerts))
             return "Alert Sent", 200
 
-        # --- DASHBOARD (LOGIC MỚI: MỞ RỘNG KHUNG GIỜ) ---
-        vn_now = datetime.now(pytz.timezone('Asia/Ho_Chi_Minh'))
+        # DASHBOARD
+        vn_now = get_vn_time() # Dùng hàm tính giờ chuẩn
         
-        # Kiểm tra xem đã gửi dashboard trong 20 phút gần đây chưa
-        # Nếu chưa VÀ phút hiện tại nằm trong khoảng 0-5 hoặc 30-35 --> GỬI
-        is_dashboard_time = vn_now.minute in [0, 1, 2, 3, 4, 5, 30, 31, 32, 33, 34, 35]
+        # Cho phép gửi trong khoảng 10 phút đầu (0-10 và 30-40) để tránh miss khi server lag
+        is_time = vn_now.minute in [0,1,2,3,4,5,6,7,8,9,10,30,31,32,33,34,35,36,37,38,39,40]
         last_sent = GLOBAL_CACHE.get('last_dashboard_time', 0)
         
-        if is_dashboard_time and (now - last_sent > 1200): # 1200s = 20 phút (Đảm bảo không gửi trùng)
+        if is_time and (now - last_sent > 1200): # Cách nhau ít nhất 20p
             def s(v): return "+" if v >= 0 else ""
             def i(v): return "🟢" if v >= 0 else "🔴"
             
@@ -267,8 +279,6 @@ def run_check():
                 f"   • GVZ: {fmt(macro['gvz']['p'], macro['gvz']['c'], macro['gvz']['pct'])}\n"
             )
             send_tele(msg)
-            
-            # Cập nhật thời gian đã gửi
             GLOBAL_CACHE['last_dashboard_time'] = now
             return "Report Sent", 200
 
