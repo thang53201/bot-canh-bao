@@ -15,6 +15,7 @@ app = Flask(__name__)
 CONFIG = {
     "TELEGRAM_TOKEN": "8309991075:AAFYyjFxQQ8CYECXPKeteeUBXQE3Mx2yfUo",
     "TELEGRAM_CHAT_ID": "5464507208",
+    
     "GOLD_H1_LIMIT": 40.0,
     "RSI_HIGH": 82, "RSI_LOW": 18, "RSI_PRICE_MOVE": 30.0,
     "VIX_VAL_LIMIT": 30, "VIX_PCT_LIMIT": 15.0,
@@ -29,7 +30,7 @@ GLOBAL_CACHE = {
     'gvz': {'p': 0, 'c': 0, 'pct': 0},
     'inf10': {'p': 0, 'c': 0}, 
     'inf05': {'p': 0, 'c': 0}, 
-    'fed': {'p': 0, 'pct': 0, 'name': 'Yield 13W'},
+    'fed': {'p': 0, 'pct': 0, 'name': 'Yield 13W (Proxy)'},
     'spdr': {'v': 0, 'c': 0},
     'be_source': 'Chờ...',
     'last_success_time': 0,
@@ -43,25 +44,24 @@ def get_vn_time(): return datetime.utcnow() + timedelta(hours=7)
 def send_tele(msg):
     try:
         requests.post(f"https://api.telegram.org/bot{CONFIG['TELEGRAM_TOKEN']}/sendMessage", 
-                      json={"chat_id": CONFIG['TELEGRAM_CHAT_ID'], "text": msg, "parse_mode": "HTML"}, timeout=10)
+                      json={"chat_id": CONFIG['TELEGRAM_CHAT_ID'], "text": msg, "parse_mode": "HTML"}, timeout=5)
     except: pass
 
 # ==============================================================================
-# 2. HÀM LẤY VÀNG (ƯU TIÊN YAHOO -> BACKUP BINANCE)
+# 2. HÀM LẤY DATA (YAHOO VÀ BINANCE)
 # ==============================================================================
 def get_random_header():
     uas = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/605.1.15",
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) Version/16.6 Mobile/15E148 Safari/604.1"
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+        "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36"
     ]
     return {"User-Agent": random.choice(uas)}
 
 def get_gold_yahoo():
-    """Nguồn chính: Yahoo Spot (XAUUSD=X)"""
+    """Ưu tiên 1: Lấy từ Yahoo Spot (Chuẩn Forex)"""
     try:
-        # Lấy nến 1h để tính RSI và H1
         url = "https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X?interval=60m&range=5d"
+        # Timeout 8s: Nếu Yahoo quay quá lâu thì bỏ qua để sang Binance
         r = requests.get(url, headers=get_random_header(), timeout=8)
         data = r.json()
         
@@ -69,45 +69,42 @@ def get_gold_yahoo():
         result = data['chart']['result'][0]
         meta = result['meta']
         quote = result['indicators']['quote'][0]
-        
         closes = [c for c in quote['close'] if c is not None]
         highs = [h for h in quote['high'] if h is not None]
         lows = [l for l in quote['low'] if l is not None]
         
-        if len(closes) < 15: return None # Dữ liệu lỗi/thiếu
+        if len(closes) < 15: return None
         
-        # 1. Giá hiện tại
-        current_price = meta['regularMarketPrice']
-        prev_close = meta['chartPreviousClose']
-        change = current_price - prev_close
-        pct = (change / prev_close) * 100
+        # 1. Giá & Thay đổi
+        cur = meta['regularMarketPrice']
+        prev = meta['chartPreviousClose']
         
-        # 2. Tính RSI (14)
-        prices = pd.Series(closes)
-        delta = prices.diff()
+        # 2. RSI
+        delta = pd.Series(closes).diff()
         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
         rs = gain / loss
         rsi = 100 - (100 / (1 + rs))
         curr_rsi = float(rsi.iloc[-1])
         
-        # 3. Tính H1 Range (Nến cuối cùng)
+        # 3. H1
         h1 = highs[-1] - lows[-1]
         
         return {
-            'p': current_price, 'c': change, 'pct': pct,
+            'p': cur, 'c': cur - prev, 'pct': (cur - prev)/prev*100,
             'h1': h1, 'rsi': curr_rsi, 'src': 'Yahoo (Spot)'
         }
     except: return None
 
 def get_gold_binance():
-    """Nguồn dự phòng: Binance (Chỉ dùng khi Yahoo chết)"""
+    """Ưu tiên 2: Lấy từ Binance (Nếu Yahoo chết)"""
     try:
-        r = requests.get("https://api.binance.com/api/v3/ticker/24hr?symbol=PAXGUSDT", timeout=8)
+        r = requests.get("https://api.binance.com/api/v3/ticker/24hr?symbol=PAXGUSDT", timeout=5)
         d = r.json()
-        k = requests.get("https://api.binance.com/api/v3/klines?symbol=PAXGUSDT&interval=1h&limit=20", timeout=8)
+        k = requests.get("https://api.binance.com/api/v3/klines?symbol=PAXGUSDT&interval=1h&limit=20", timeout=5)
         kd = k.json()
         closes = [float(x[4]) for x in kd]
+        
         if len(closes) >= 15:
             delta = pd.Series(closes).diff()
             gain = (delta.where(delta > 0, 0)).rolling(14).mean()
@@ -116,30 +113,33 @@ def get_gold_binance():
             rsi = 100 - (100 / (1 + rs))
             curr_rsi = float(rsi.iloc[-1])
         else: curr_rsi = 50.0
+
         last = kd[-1]
         h1 = float(last[2]) - float(last[3])
+
         return {'p': float(d['lastPrice']), 'c': float(d['priceChange']), 'pct': float(d['priceChangePercent']), 'h1': h1, 'rsi': curr_rsi, 'src': 'Binance (Backup)'}
     except: return None
 
-def update_gold_data():
+def update_gold_logic():
     global GLOBAL_CACHE
     
-    # 1. Thử Yahoo trước (Nguồn chuẩn Forex)
-    new_gold = get_gold_yahoo()
+    # 1. Thử Yahoo trước
+    gold = get_gold_yahoo()
     
-    # 2. Nếu Yahoo lỗi, dùng Binance (Dự phòng)
-    if not new_gold:
-        new_gold = get_gold_binance()
+    # 2. Nếu Yahoo lỗi, thử Binance
+    if not gold:
+        gold = get_gold_binance()
         
     # 3. Cập nhật Cache
-    if new_gold:
-        GLOBAL_CACHE['gold'] = new_gold
+    if gold:
+        GLOBAL_CACHE['gold'] = gold
     else:
+        # Nếu cả 2 chết, giữ giá cũ
         if GLOBAL_CACHE['gold']['p'] > 0:
-            GLOBAL_CACHE['gold']['src'] = "Mất kết nối (Dữ liệu cũ)"
+            GLOBAL_CACHE['gold']['src'] = "Mất kết nối (Giá cũ)"
 
 # ==============================================================================
-# 3. MACRO (5 PHÚT/LẦN)
+# 3. MACRO (YAHOO 5 PHÚT)
 # ==============================================================================
 def get_yahoo_macro(symbol):
     try:
@@ -148,6 +148,17 @@ def get_yahoo_macro(symbol):
         d = r.json()
         c = [x for x in d['chart']['result'][0]['indicators']['quote'][0]['close'] if x]
         if len(c) >= 2: return c[-1], c[-1]-c[-2], (c[-1]-c[-2])/c[-2]*100
+    except: return None
+
+def get_fred_data(sid):
+    try:
+        url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}"
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+        if r.status_code == 200:
+            df = pd.read_csv(io.StringIO(r.text))
+            df = df[df[sid] != '.']
+            df[sid] = pd.to_numeric(df[sid])
+            if len(df) >= 2: return float(df.iloc[-1][sid]), float(df.iloc[-1][sid]) - float(df.iloc[-2][sid])
     except: return None
 
 def get_spdr_smart():
@@ -178,42 +189,51 @@ def update_macro_data():
     if res10:
         GLOBAL_CACHE['be_source'] = "Lạm phát (Breakeven)"
         GLOBAL_CACHE['inf10'] = {'p': res10[0], 'c': res10[1]}
-    else: GLOBAL_CACHE['be_source'] = "Lạm phát (Chờ...)"
+    else:
+        fred10 = get_fred_data("T10YIE")
+        if fred10:
+            GLOBAL_CACHE['be_source'] = "Lạm phát (FRED)"
+            GLOBAL_CACHE['inf10'] = {'p': fred10[0], 'c': fred10[1]}
+        else:
+            GLOBAL_CACHE['be_source'] = "Lạm phát (Chờ...)"
 
     res05 = get_yahoo_macro("^T5YIE")
     if res05: GLOBAL_CACHE['inf05'] = {'p': res05[0], 'c': res05[1]}
+    else:
+        fred05 = get_fred_data("T5YIE")
+        if fred05: GLOBAL_CACHE['inf05'] = {'p': fred05[0], 'c': fred05[1]}
 
     res_fed = get_yahoo_macro("^IRX")
     if res_fed: GLOBAL_CACHE['fed'] = {'p': res_fed[0], 'pct': res_fed[2], 'name': 'Yield 13W'}
     
     GLOBAL_CACHE['last_success_time'] = current_time
 
+def get_data_final():
+    update_gold_logic()
+    try: update_macro_data()
+    except: pass
+    return GLOBAL_CACHE['gold'], GLOBAL_CACHE
+
 # ==============================================================================
-# 4. ROUTING & RUN
+# 4. ROUTING
 # ==============================================================================
 @app.route('/')
-def home(): return "Bot V61 - Yahoo First"
+def home(): return "Bot V63 - Yahoo First"
 
 @app.route('/test')
 def run_test():
-    update_gold_data()
-    gold = GLOBAL_CACHE['gold']
-    send_tele(f"🔔 TEST. Gold: {gold['p']} ({gold['src']})")
+    gold, _ = get_data_final()
+    send_tele(f"🔔 TEST OK. Gold: {gold['p']} ({gold['src']})")
     return "OK", 200
 
 @app.route('/run_check')
 def run_check():
     try:
-        update_gold_data() # Lấy vàng (Ưu tiên Yahoo)
-        try: update_macro_data()
-        except: pass
-        
-        gold = GLOBAL_CACHE['gold']
-        macro = GLOBAL_CACHE
+        gold, macro = get_data_final()
         alerts = []
         now = time.time()
         
-        # CẢNH BÁO
+        # CẢNH BÁO (Chỉ chạy nếu Gold > 0)
         if gold['p'] > 0:
             if gold['rsi'] > CONFIG['RSI_HIGH'] and gold['h1'] > CONFIG['RSI_PRICE_MOVE']:
                 if now - last_alert_times.get('RSI', 0) > CONFIG['ALERT_COOLDOWN']:
@@ -256,6 +276,7 @@ def run_check():
             
             def fmt(val, chg, pct): return f"{val:.2f} ({s(pct)}{pct:.2f}%)" if val else "N/A"
             def fmt_pts(val, chg): return f"{val:.3f}% (Chg: {s(chg)}{chg:.3f})" if val else "N/A"
+
             gold_p = f"{gold['p']:.1f}" if gold['p'] > 0 else "N/A"
 
             msg = (
