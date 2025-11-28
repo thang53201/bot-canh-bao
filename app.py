@@ -10,7 +10,7 @@ import pytz
 app = Flask(__name__)
 
 # ==============================================================================
-# 1. CẤU HÌNH (ĐÃ SỬA LOGIC FED CHO ĐÚNG VỚI IRX)
+# 1. CẤU HÌNH (GIỮ NGUYÊN LOGIC V77)
 # ==============================================================================
 CONFIG = {
     "TELEGRAM_TOKEN": "8309991075:AAFYyjFxQQ8CYECXPKeteeUBXQE3Mx2yfUo",
@@ -24,11 +24,8 @@ CONFIG = {
     "VIX_VAL_LIMIT": 30, "VIX_PCT_LIMIT": 15.0,
     "GVZ_VAL_LIMIT": 25, "GVZ_PCT_LIMIT": 10.0,
     
-    # LẠM PHÁT (Tính bằng ĐIỂM)
+    # LẠM PHÁT & FED (ĐIỂM SỐ)
     "INF_10Y_LIMIT": 0.25, 
-    
-    # FEDWATCH (^IRX) - SỬA THÀNH TÍNH BẰNG ĐIỂM
-    # 0.15 điểm (Ví dụ 3.75 -> 3.90) là biến động cực lớn cho lãi suất
     "FED_POINT_LIMIT": 0.15, 
     
     "ALERT_COOLDOWN": 3600
@@ -40,7 +37,7 @@ GLOBAL_CACHE = {
     'gvz': {'p': 0, 'c': 0, 'pct': 0},
     'inf10': {'p': 0, 'c': 0}, 
     'inf05': {'p': 0, 'c': 0}, 
-    'fed': {'p': 0, 'c': 0, 'pct': 0, 'name': 'Yield 13W'},
+    'fed': {'p': 0, 'pct': 0, 'name': 'Yield 13W'},
     'spdr': {'v': 0, 'c': 0},
     'be_source': 'Chờ...',
     'last_success_time': 0,
@@ -58,17 +55,30 @@ def send_tele(msg):
     except: pass
 
 # ==============================================================================
-# 2. VÀNG BINANCE
+# 2. VÀNG GATE.IO (XAU_USDT) - SÁT GIÁ EXNESS
 # ==============================================================================
-def get_gold_binance():
+def get_gold_gate():
+    """
+    Lấy giá từ Gate.io. Sàn này giá XAU rất chuẩn với Spot.
+    Không bị chặn IP như Yahoo.
+    """
     try:
-        r = requests.get("https://api.binance.com/api/v3/ticker/24hr?symbol=PAXGUSDT", timeout=5)
-        d = r.json()
-        k = requests.get("https://api.binance.com/api/v3/klines?symbol=PAXGUSDT&interval=1h&limit=20", timeout=5)
-        kd = k.json()
-        closes = [float(x[4]) for x in kd]
+        # 1. Lấy giá hiện tại
+        url = "https://api.gateio.ws/api/v4/spot/tickers?currency_pair=XAU_USDT"
+        r = requests.get(url, timeout=10)
+        data = r.json()[0]
+        
+        # 2. Lấy nến H1 (20 cây gần nhất)
+        k_url = "https://api.gateio.ws/api/v4/spot/candlesticks?currency_pair=XAU_USDT&interval=1h&limit=20"
+        kr = requests.get(k_url, timeout=10)
+        k_data = kr.json()
+        
+        # Gate trả về dạng list [time, volume, close, high, low, open]
+        # Lưu ý: Dữ liệu là String, cần ép kiểu
+        closes = [float(x[2]) for x in k_data]
         
         if len(closes) >= 15:
+            # Tính RSI
             delta = pd.Series(closes).diff()
             gain = (delta.where(delta > 0, 0)).rolling(14).mean()
             loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
@@ -77,14 +87,29 @@ def get_gold_binance():
             curr_rsi = float(rsi.iloc[-1])
         else: curr_rsi = 50.0
 
-        last = kd[-1]
-        h1 = float(last[2]) - float(last[3])
+        # Tính H1 Range (Cây nến mới nhất)
+        last = k_data[-1]
+        h1 = float(last[3]) - float(last[4]) # High - Low
 
-        return {'p': float(d['lastPrice']), 'c': float(d['priceChange']), 'pct': float(d['priceChangePercent']), 'h1': h1, 'rsi': curr_rsi, 'src': 'Binance'}
-    except: return None
+        # Tính Change trong ngày
+        price = float(data['last'])
+        pct = float(data['change_percentage'])
+        change = price * (pct / 100)
+
+        return {
+            'p': price, 
+            'c': change, 
+            'pct': pct, 
+            'h1': h1, 
+            'rsi': curr_rsi, 
+            'src': 'Gate.io (Spot)'
+        }
+    except Exception as e: 
+        print(f"Gate Error: {e}")
+        return None
 
 # ==============================================================================
-# 3. MACRO
+# 3. MACRO (V77 LOGIC)
 # ==============================================================================
 def get_yahoo_data(symbol):
     try:
@@ -128,11 +153,13 @@ def update_macro_data():
     
     if current_time - GLOBAL_CACHE['last_success_time'] < 300: return
 
-    # VIX/GVZ
+    # VIX & GVZ
     res = get_yahoo_data("^VIX")
     if res: GLOBAL_CACHE['vix'] = {'p': res[0], 'c': res[1], 'pct': res[2]}
     res = get_yahoo_data("^GVZ")
     if res: GLOBAL_CACHE['gvz'] = {'p': res[0], 'c': res[1], 'pct': res[2]}
+    
+    # SPDR
     res = get_spdr_smart()
     if res: GLOBAL_CACHE['spdr'] = {'v': res[0], 'c': res[1]}
     
@@ -142,6 +169,7 @@ def update_macro_data():
         GLOBAL_CACHE['be_source'] = "Lạm phát (Yahoo)"
         GLOBAL_CACHE['inf10'] = {'p': res10[0], 'c': res10[1]}
     else:
+        # Fallback FRED
         fred10 = get_fred_data("T10YIE")
         if fred10:
             GLOBAL_CACHE['be_source'] = "Lạm phát (FRED)"
@@ -155,21 +183,22 @@ def update_macro_data():
         fred05 = get_fred_data("T5YIE")
         if fred05: GLOBAL_CACHE['inf05'] = {'p': fred05[0], 'c': fred05[1]}
 
-    # FEDWATCH (^IRX)
+    # FEDWATCH (^IRX Proxy)
     res_fed = get_yahoo_data("^IRX")
-    if res_fed: 
-        # Lưu cả 'c' (thay đổi điểm) để so sánh
-        GLOBAL_CACHE['fed'] = {'p': res_fed[0], 'c': res_fed[1], 'pct': res_fed[2], 'name': 'Yield 13W'}
+    if res_fed: GLOBAL_CACHE['fed'] = {'p': res_fed[0], 'c': res_fed[1], 'pct': res_fed[2], 'name': 'Yield 13W'}
     
     GLOBAL_CACHE['last_success_time'] = current_time
 
 def get_data_final():
-    gold = get_gold_binance()
+    # Dùng Gate.io thay Binance
+    gold = get_gold_gate()
     if not gold: 
         if GLOBAL_CACHE['gold']['p'] > 0: gold = GLOBAL_CACHE['gold']
         else: gold = {'p': 0, 'c': 0, 'pct': 0, 'h1': 0, 'rsi': 50, 'src': 'Khởi động...'}
+    
     try: update_macro_data()
     except: pass
+    
     GLOBAL_CACHE['gold'] = gold
     return gold, GLOBAL_CACHE
 
@@ -177,12 +206,12 @@ def get_data_final():
 # 4. ROUTING
 # ==============================================================================
 @app.route('/')
-def home(): return "Bot V77 - Fed Points Fix"
+def home(): return "Bot V79 - Gate.io Spot"
 
 @app.route('/test')
 def run_test():
     gold, _ = get_data_final()
-    send_tele(f"🔔 TEST OK. Gold: {gold['p']}")
+    send_tele(f"🔔 TEST OK. Gold: {gold['p']} ({gold['src']})")
     return "OK", 200
 
 @app.route('/run_check')
@@ -192,22 +221,22 @@ def run_check():
         alerts = []
         now = time.time()
         
-        # ALERT VÀNG
+        # CẢNH BÁO VÀNG
         if gold['p'] > 0:
             if gold['rsi'] > CONFIG['RSI_HIGH'] and gold['h1'] > CONFIG['RSI_PRICE_MOVE']:
                 if now - last_alert_times.get('RSI', 0) > CONFIG['ALERT_COOLDOWN']:
-                    alerts.append(f"🚀 <b>SIÊU TREND TĂNG:</b> RSI {gold['rsi']:.0f} + H1 {gold['h1']:.1f}$")
+                    alerts.append(f"🚀 <b>SIÊU TREND TĂNG:</b> RSI {gold['rsi']:.0f} + H1 chạy {gold['h1']:.1f}$")
                     last_alert_times['RSI'] = now
             if gold['rsi'] < CONFIG['RSI_LOW'] and gold['h1'] > CONFIG['RSI_PRICE_MOVE']:
                 if now - last_alert_times.get('RSI', 0) > CONFIG['ALERT_COOLDOWN']:
-                    alerts.append(f"🩸 <b>SIÊU TREND GIẢM:</b> RSI {gold['rsi']:.0f} + H1 {gold['h1']:.1f}$")
+                    alerts.append(f"🩸 <b>SIÊU TREND GIẢM:</b> RSI {gold['rsi']:.0f} + H1 sập {gold['h1']:.1f}$")
                     last_alert_times['RSI'] = now
             if gold['h1'] > CONFIG['GOLD_H1_LIMIT']:
                 if now - last_alert_times.get('H1', 0) > CONFIG['ALERT_COOLDOWN']:
                     alerts.append(f"🚨 <b>VÀNG SỐC:</b> H1 {gold['h1']:.1f} giá")
                     last_alert_times['H1'] = now
-
-        # ALERT MACRO
+        
+        # CẢNH BÁO VĨ MÔ
         if macro['vix']['p'] > CONFIG['VIX_VAL_LIMIT']:
              if now - last_alert_times.get('VIX', 0) > CONFIG['ALERT_COOLDOWN']:
                 alerts.append(f"⚠️ <b>VIX BÁO ĐỘNG:</b> {macro['vix']['p']:.2f}")
@@ -218,9 +247,8 @@ def run_check():
                 alerts.append(f"🇺🇸 <b>LẠM PHÁT SỐC:</b> Đổi {abs(macro['inf10']['c']):.3f} điểm")
                 last_alert_times['INF10'] = now
         
-        # ALERT FEDWATCH (SỬA LOGIC: DÙNG ĐIỂM THAY VÌ %)
-        if abs(macro['fed']['c']) > CONFIG['FED_POINT_LIMIT']:
-            if now - last_alert_times.get('FED', 0) > CONFIG['ALERT_COOLDOWN']:
+        if abs(macro['fed']['c']) > CONFIG['FED_POINT_LIMIT'] if 'FED_POINT_LIMIT' in CONFIG else 0.15:
+             if now - last_alert_times.get('FED', 0) > CONFIG['ALERT_COOLDOWN']:
                 alerts.append(f"🏦 <b>FED BIẾN ĐỘNG:</b> Đổi {abs(macro['fed']['c']):.3f} điểm")
                 last_alert_times['FED'] = now
 
@@ -243,11 +271,13 @@ def run_check():
             def fmt(val, chg, pct): return f"{val:.2f} ({s(pct)}{pct:.2f}%)" if val else "N/A"
             def fmt_pts(val, chg): return f"{val:.3f}% (Chg: {s(chg)}{chg:.3f})" if val else "N/A"
 
+            gold_p = f"{gold['p']:.1f}" if gold['p'] > 0 else "N/A"
+
             msg = (
                 f"📊 <b>MARKET DASHBOARD (D1)</b>\n"
                 f"Time: {vn_now.strftime('%H:%M')}\n"
                 f"-------------------------------\n"
-                f"🥇 <b>GOLD (PAXG):</b> {gold['p']:.1f}\n"
+                f"🥇 <b>GOLD (XAU/USD):</b> {gold_p}\n"
                 f"   {i(gold['c'])} {s(gold['c'])}{gold['c']:.1f}$ ({s(gold['pct'])}{gold['pct']:.2f}%)\n"
                 f"   🎯 <b>RSI (H1):</b> {gold['rsi']:.1f}\n"
                 f"-------------------------------\n"
@@ -258,7 +288,7 @@ def run_check():
                 f"   • 05Y: {fmt_pts(macro['inf05']['p'], macro['inf05']['c'])}\n"
                 f"-------------------------------\n"
                 f"🏦 <b>FedWatch ({macro['fed']['name']}):</b>\n"
-                f"   • Mức: {fmt_pts(macro['fed']['p'], macro['fed']['c'])}\n"
+                f"   • Mức: {fmt(macro['fed']['p'], 0, macro['fed']['pct'])}\n"
                 f"-------------------------------\n"
                 f"📉 <b>Risk:</b>\n"
                 f"   • VIX: {fmt(macro['vix']['p'], macro['vix']['c'], macro['vix']['pct'])}\n"
