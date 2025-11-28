@@ -3,7 +3,7 @@ import requests
 import pandas as pd
 import io
 import time
-import csv  # Thêm thư viện này để xử lý file SPDR
+import csv
 import random
 from datetime import datetime, timedelta
 import pytz
@@ -16,22 +16,13 @@ app = Flask(__name__)
 CONFIG = {
     "TELEGRAM_TOKEN": "8309991075:AAFYyjFxQQ8CYECXPKeteeUBXQE3Mx2yfUo",
     "TELEGRAM_CHAT_ID": "5464507208",
-    
-    # API KEY TWELVE DATA
     "TWELVE_DATA_KEY": "3d1252ab61b947bda28b0e532947ae34", 
-    
-    # NGƯỠNG CẢNH BÁO
     "GOLD_H1_LIMIT": 40.0,
     "RSI_HIGH": 82, "RSI_LOW": 18, "RSI_PRICE_MOVE": 30.0,
-    
     "VIX_VAL_LIMIT": 30, "VIX_PCT_LIMIT": 15.0,
     "GVZ_VAL_LIMIT": 25, "GVZ_PCT_LIMIT": 10.0, 
-    
-    "INF_10Y_LIMIT": 0.25, 
-    "FED_PCT_LIMIT": 15.0,
-    
     "ALERT_COOLDOWN": 3600,
-    "SPDR_CACHE_TIME": 1800 # 30 phút cập nhật SPDR 1 lần
+    "SPDR_CACHE_TIME": 1800
 }
 
 GLOBAL_CACHE = {
@@ -41,11 +32,10 @@ GLOBAL_CACHE = {
     'inf10': {'p': 0, 'c': 0}, 
     'inf05': {'p': 0, 'c': 0}, 
     'fed': {'p': 0, 'pct': 0, 'name': 'Yield 13W'},
-    # Cập nhật cấu trúc cache cho SPDR
     'spdr': {'v': 0, 'c': 0, 'alert_msg': '', 'is_emergency': False}, 
     'be_source': 'Chờ...',
     'last_success_time': 0,
-    'last_spdr_time': 0, # Time riêng cho SPDR
+    'last_spdr_time': 0,
     'last_dashboard_time': 0
 }
 
@@ -60,7 +50,7 @@ def send_tele(msg):
     except: pass
 
 # ==============================================================================
-# 2. HÀM LẤY VÀNG (TWELVE DATA + BINANCE TECH)
+# 2. HÀM LẤY VÀNG
 # ==============================================================================
 def get_gold_forex_api():
     try:
@@ -96,7 +86,7 @@ def get_gold_binance_full():
     except: return None
 
 # ==============================================================================
-# 3. MACRO (YAHOO, FRED, SPDR MỚI)
+# 3. MACRO & SPDR (FIX THÔNG MINH)
 # ==============================================================================
 def get_yahoo_data(symbol):
     try:
@@ -122,10 +112,11 @@ def get_fred_data(sid):
                 return float(df.iloc[-1][sid]), float(df.iloc[-1][sid]) - float(df.iloc[-2][sid])
     except: return None
 
-# --- LOGIC SPDR MỚI (CHECK 5 TẤN HOẶC 3 NGÀY LIÊN TIẾP) ---
 def get_spdr_advanced():
     """
-    Trả về dict: {tonnes, change_today, alert_msg, is_emergency}
+    Logic mới: Quét ngược từ dưới lên.
+    Chỉ chấp nhận dòng nào có số liệu Tấn > 0.
+    Bỏ qua các dòng lỗi/rỗng ở cuối file.
     """
     url = "https://www.spdrgoldshares.com/assets/dynamic/GLD/GLD_US_archive_EN.csv"
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -134,28 +125,47 @@ def get_spdr_advanced():
         response = requests.get(url, headers=headers, timeout=15, verify=False)
         if response.status_code != 200: return None
         
-        # Parse CSV thủ công để tránh lỗi header
         content = response.content.decode('utf-8')
+        # Lọc lấy các dòng có ngày tháng (bắt đầu bằng số)
         lines = [line for line in content.splitlines() if len(line) > 10 and line[0].isdigit()]
         reader = csv.reader(lines)
         rows = list(reader)
         
-        if len(rows) < 4: return None
+        if not rows: return None
 
-        last_4 = rows[-4:] # Lấy 4 ngày cuối
+        # --- LOGIC QUÉT NGƯỢC TÌM SỐ LIỆU THỰC ---
+        valid_values = [] # Danh sách chứa số tấn hợp lệ tìm được
         
-        def extract_tonnes(row):
+        # Duyệt ngược từ dòng cuối cùng lên trên
+        for row in reversed(rows):
+            # Cố gắng tìm số tấn trong dòng này
+            found_tonnes = 0.0
             for item in row:
                 try:
                     val = float(item.replace(',', ''))
-                    if 600 < val < 2000: return val
+                    # SPDR holdings luôn > 600 tấn. Nếu < 600 coi như rác/lỗi/số khác
+                    if 600 < val < 2000: 
+                        found_tonnes = val
+                        break
                 except: continue
-            return 0.0
+            
+            # Nếu tìm thấy số tấn hợp lệ > 0, lưu vào danh sách
+            if found_tonnes > 0:
+                valid_values.append(found_tonnes)
+            
+            # Chỉ cần tìm đủ 4 giá trị gần nhất là dừng (để tính change)
+            if len(valid_values) >= 4:
+                break
+        
+        # Nếu không tìm được ít nhất 2 giá trị (Hôm nay, Hôm qua) thì chịu
+        if len(valid_values) < 2:
+            return {'v': 0, 'c': 0, 'alert_msg': '', 'is_emergency': False}
 
-        t0 = extract_tonnes(last_4[3]) # Nay
-        t1 = extract_tonnes(last_4[2]) # Qua
-        t2 = extract_tonnes(last_4[1]) # Kia
-        t3 = extract_tonnes(last_4[0]) # Kìa
+        # Gán giá trị (Lưu ý: valid_values[0] là mới nhất, [1] là hôm qua...)
+        t0 = valid_values[0] # Mới nhất (Real-time)
+        t1 = valid_values[1] # Hôm qua
+        t2 = valid_values[2] if len(valid_values) > 2 else t1
+        t3 = valid_values[3] if len(valid_values) > 3 else t2
 
         change_today = t0 - t1
         change_1 = t1 - t2
@@ -164,13 +174,12 @@ def get_spdr_advanced():
         alert_msg = ""
         is_emergency = False
         
-        # 1. Check > 5 tấn
+        # Logic cảnh báo
         if abs(change_today) >= 5.0:
             action = "MUA KHỦNG" if change_today > 0 else "XẢ KHỦNG"
             alert_msg = f"🐋 <b>SPDR {action}:</b> {abs(change_today):.2f} tấn!"
             is_emergency = True
             
-        # 2. Check 3 ngày liên tiếp
         elif change_today > 0 and change_1 > 0 and change_2 > 0:
             alert_msg = f"⚠️ <b>SPDR MUA RÒNG:</b> 3 ngày liên tiếp (+{change_today:.2f}t)"
             is_emergency = True
@@ -178,12 +187,7 @@ def get_spdr_advanced():
             alert_msg = f"⚠️ <b>SPDR XẢ RÒNG:</b> 3 ngày liên tiếp ({change_today:.2f}t)"
             is_emergency = True
             
-        return {
-            'v': t0, 
-            'c': change_today, 
-            'alert_msg': alert_msg, 
-            'is_emergency': is_emergency
-        }
+        return {'v': t0, 'c': change_today, 'alert_msg': alert_msg, 'is_emergency': is_emergency}
         
     except: return None
 
@@ -191,23 +195,19 @@ def update_macro_data():
     global GLOBAL_CACHE
     current_time = time.time()
     
-    # Update SPDR mỗi 30 phút (1800s)
     if current_time - GLOBAL_CACHE.get('last_spdr_time', 0) > CONFIG['SPDR_CACHE_TIME']:
         spdr_res = get_spdr_advanced()
         if spdr_res:
             GLOBAL_CACHE['spdr'] = spdr_res
             GLOBAL_CACHE['last_spdr_time'] = current_time
 
-    # Các chỉ số khác cập nhật mỗi 5 phút (300s)
     if current_time - GLOBAL_CACHE['last_success_time'] < 300: return
 
-    # VIX & GVZ
     res = get_yahoo_data("^VIX")
     if res: GLOBAL_CACHE['vix'] = {'p': res[0], 'c': res[1], 'pct': res[2]}
     res = get_yahoo_data("^GVZ")
     if res: GLOBAL_CACHE['gvz'] = {'p': res[0], 'c': res[1], 'pct': res[2]}
     
-    # LẠM PHÁT
     inf10 = get_fred_data("T10YIE")
     if inf10:
         GLOBAL_CACHE['be_source'] = "Lạm phát (FRED)"
@@ -217,7 +217,6 @@ def update_macro_data():
         if res10:
             GLOBAL_CACHE['be_source'] = "Lạm phát (Yahoo)"
             GLOBAL_CACHE['inf10'] = {'p': res10[0], 'c': res10[1]}
-        else: GLOBAL_CACHE['be_source'] = "Lạm phát (Chờ...)"
 
     res05 = get_yahoo_data("^T5YIE")
     if res05: GLOBAL_CACHE['inf05'] = {'p': res05[0], 'c': res05[1]}
@@ -225,15 +224,13 @@ def update_macro_data():
         fred05 = get_fred_data("T5YIE")
         if fred05: GLOBAL_CACHE['inf05'] = {'p': fred05[0], 'c': fred05[1]}
 
-    # FEDWATCH
     res_fed = get_yahoo_data("^IRX")
     if res_fed: GLOBAL_CACHE['fed'] = {'p': res_fed[0], 'pct': res_fed[2], 'name': 'Yield 13W'}
     
     GLOBAL_CACHE['last_success_time'] = current_time
 
 def get_data_final():
-    curr_min = datetime.utcnow().minute
-    gold = get_gold_forex_api() if curr_min in [0,1,30,31] else get_gold_binance_full()
+    gold = get_gold_forex_api()
     if not gold: gold = get_gold_binance_full()
     if not gold: 
         if GLOBAL_CACHE['gold']['p'] > 0: gold = GLOBAL_CACHE['gold']
@@ -247,13 +244,12 @@ def get_data_final():
 # 4. ROUTING
 # ==============================================================================
 @app.route('/')
-def home(): return "Bot V81 - SPDR Advanced"
+def home(): return "Bot V81 - Smart SPDR Fix"
 
 @app.route('/test')
 def run_test():
     gold, macro = get_data_final()
-    spdr_status = "Có dữ liệu" if macro['spdr']['v'] > 0 else "Chưa có"
-    send_tele(f"🔔 TEST OK. Gold: {gold['p']}. SPDR: {spdr_status}")
+    send_tele(f"🔔 TEST OK. Gold: {gold['p']}. SPDR: {macro['spdr']['v']}t")
     return "OK", 200
 
 @app.route('/run_check')
@@ -263,15 +259,14 @@ def run_check():
         alerts = []
         now = time.time()
         
-        # --- CẢNH BÁO SPDR (MỚI THÊM) ---
+        # ALERT SPDR
         spdr = macro['spdr']
         if spdr['is_emergency']:
-            # Dùng cooldown riêng cho SPDR để tránh spam nếu nó giữ nguyên trạng thái
             if now - last_alert_times.get('SPDR', 0) > CONFIG['ALERT_COOLDOWN']:
                 alerts.append(spdr['alert_msg'])
                 last_alert_times['SPDR'] = now
 
-        # CẢNH BÁO VÀNG
+        # ALERT GOLD & RISK
         if gold['p'] > 0:
             if gold['rsi'] > CONFIG['RSI_HIGH'] and gold['h1'] > CONFIG['RSI_PRICE_MOVE']:
                 if now - last_alert_times.get('RSI', 0) > CONFIG['ALERT_COOLDOWN']:
@@ -281,38 +276,30 @@ def run_check():
                 if now - last_alert_times.get('RSI', 0) > CONFIG['ALERT_COOLDOWN']:
                     alerts.append(f"🩸 <b>SIÊU TREND GIẢM:</b> RSI {gold['rsi']:.0f} + H1 sập {gold['h1']:.1f}$")
                     last_alert_times['RSI'] = now
-            if gold['h1'] > CONFIG['GOLD_H1_LIMIT']:
+            if abs(gold['h1']) > CONFIG['GOLD_H1_LIMIT']:
                 if now - last_alert_times.get('H1', 0) > CONFIG['ALERT_COOLDOWN']:
-                    alerts.append(f"🚨 <b>VÀNG SỐC:</b> H1 {gold['h1']:.1f} giá")
+                    alerts.append(f"🚨 <b>VÀNG SỐC:</b> H1 biến động {gold['h1']:.1f} giá")
                     last_alert_times['H1'] = now
         
-        # CẢNH BÁO VIX
         if macro['vix']['p'] > CONFIG['VIX_VAL_LIMIT'] or macro['vix']['pct'] > CONFIG['VIX_PCT_LIMIT']:
              if now - last_alert_times.get('VIX', 0) > CONFIG['ALERT_COOLDOWN']:
                 alerts.append(f"⚠️ <b>VIX BÁO ĐỘNG:</b> {macro['vix']['p']:.2f}")
                 last_alert_times['VIX'] = now
-        
-        # CẢNH BÁO GVZ
-        if macro['gvz']['p'] > CONFIG['GVZ_VAL_LIMIT'] or macro['gvz']['pct'] > CONFIG['GVZ_PCT_LIMIT']:
-             if now - last_alert_times.get('GVZ', 0) > CONFIG['ALERT_COOLDOWN']:
-                alerts.append(f"🌪 <b>GVZ BÁO ĐỘNG:</b> {macro['gvz']['p']:.2f}")
-                last_alert_times['GVZ'] = now
 
         if alerts:
             send_tele(f"🔥🔥 <b>CẢNH BÁO KHẨN</b> 🔥🔥\n\n" + "\n".join(alerts))
             return "Alert Sent", 200
 
-        # DASHBOARD
+        # DASHBOARD (Chỉ gửi 1 lần mỗi khung 30 phút)
         vn_now = get_vn_time()
         is_time = vn_now.minute in [0,1,2,3,4,5,30,31,32,33,34,35]
         last_sent = GLOBAL_CACHE.get('last_dashboard_time', 0)
         
-        if is_time and (now - last_sent > 1200):
+        if is_time and (now - last_sent > 1500): 
             def s(v): return "+" if v >= 0 else ""
             def i(v): return "🟢" if v >= 0 else "🔴"
             
-            # Format hiển thị SPDR
-            spdr_txt = f"{macro['spdr']['v']:.2f} tấn" if macro['spdr']['v'] > 0 else "Chờ cập nhật"
+            spdr_txt = f"{macro['spdr']['v']:.2f} tấn" if macro['spdr']['v'] > 0 else "Chờ cập nhật..."
             spdr_chg = f"({s(macro['spdr']['c'])}{macro['spdr']['c']:.2f})" if macro['spdr']['v'] > 0 else ""
             
             def fmt(val, chg, pct): return f"{val:.2f} ({s(pct)}{pct:.2f}%)" if val else "N/A"
