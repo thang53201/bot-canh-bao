@@ -11,24 +11,22 @@ import pytz
 app = Flask(__name__)
 
 # ==============================================================================
-# 1. CẤU HÌNH (ĐÃ BAO GỒM LẠM PHÁT & FED)
+# 1. CẤU HÌNH
 # ==============================================================================
 CONFIG = {
     "TELEGRAM_TOKEN": "8309991075:AAFYyjFxQQ8CYECXPKeteeUBXQE3Mx2yfUo",
     "TELEGRAM_CHAT_ID": "5464507208",
     "TWELVE_DATA_KEY": "3d1252ab61b947bda28b0e532947ae34", 
     
-    # 1. VÀNG
+    # 1. VÀNG (Dùng API Twelve Data)
     "GOLD_H1_LIMIT": 40.0,
     "RSI_HIGH": 82, "RSI_LOW": 18, "RSI_PRICE_MOVE": 30.0,
     
-    # 2. RỦI RO (VIX, GVZ)
+    # 2. RỦI RO & VĨ MÔ (Giữ nguyên cấu hình cũ)
     "VIX_VAL_LIMIT": 30, "VIX_PCT_LIMIT": 15.0,
     "GVZ_VAL_LIMIT": 25, "GVZ_PCT_LIMIT": 10.0, 
-    
-    # 3. VĨ MÔ (LẠM PHÁT & FED) - Đã kích hoạt lại
-    "INF_10Y_LIMIT": 0.25,  # Biến động 0.25 điểm là rất lớn
-    "FED_PCT_LIMIT": 15.0,  # Thay đổi xác suất 15%
+    "INF_10Y_LIMIT": 0.25, 
+    "FED_PCT_LIMIT": 15.0,
     
     "ALERT_COOLDOWN": 3600,
     "SPDR_CACHE_TIME": 1800
@@ -59,48 +57,77 @@ def send_tele(msg):
     except: pass
 
 # ==============================================================================
-# 2. HÀM LẤY VÀNG
+# 2. HÀM LẤY VÀNG (MỚI - 100% API TWELVE DATA)
 # ==============================================================================
-def get_gold_forex_api():
-    try:
-        url = f"https://api.twelvedata.com/quote?symbol=XAU/USD&apikey={CONFIG['TWELVE_DATA_KEY']}"
-        r = requests.get(url, timeout=10)
-        d = r.json()
-        if 'close' in d:
-            tech = get_gold_binance_tech()
-            return {'p': float(d['close']), 'c': float(d['change']), 'pct': float(d['percent_change']), 'h1': tech['h1'], 'rsi': tech['rsi'], 'src': 'Forex API (Chuẩn)'}
-    except: pass
-    return None
+def calculate_rsi(prices, periods=14):
+    """Tính RSI từ danh sách giá (New logic)"""
+    if len(prices) < periods + 1: return 50
+    # Pandas cần dữ liệu từ cũ -> mới
+    delta = pd.Series(prices).diff()
+    gain = (delta.where(delta > 0, 0)).rolling(periods).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(periods).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return float(rsi.iloc[-1])
 
-def get_gold_binance_tech():
+def get_gold_api_full():
+    """
+    Thay thế hoàn toàn get_gold_forex_api cũ và get_gold_binance.
+    Chỉ dùng 1 API Twelve Data để lấy cả Giá và RSI.
+    """
     try:
-        k = requests.get("https://api.binance.com/api/v3/klines?symbol=PAXGUSDT&interval=1h&limit=20", timeout=5).json()
-        closes = [float(x[4]) for x in k]
-        if len(closes) >= 15:
-            delta = pd.Series(closes).diff()
-            gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-            rs = gain / loss
-            rsi = 100 - (100 / (1 + rs))
-            last = k[-1]
-            h1 = float(last[2]) - float(last[3])
-            return {'h1': h1, 'rsi': float(rsi.iloc[-1])}
-    except: return {'h1': 0, 'rsi': 50}
+        # Endpoint time_series trả về nến (Open, High, Low, Close)
+        url = f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=1h&outputsize=20&apikey={CONFIG['TWELVE_DATA_KEY']}"
+        r = requests.get(url, timeout=15)
+        data = r.json()
+        
+        if 'values' in data:
+            # API trả về: Mới nhất [0] -> Cũ nhất [n]
+            candles = data['values']
+            current = candles[0]
+            
+            # 1. Lấy giá
+            price = float(current['close'])
+            open_price = float(current['open'])
+            
+            # Tính change so với mở nến H1 (hoặc so với nến trước tùy logic, ở đây lấy change trong phiên H1)
+            change = price - open_price
+            percent = (change / open_price) * 100
+            
+            # 2. Tính RSI
+            # Đảo ngược mảng để có thứ tự Cũ -> Mới cho Pandas
+            closes_history = [float(c['close']) for c in candles][::-1]
+            rsi = calculate_rsi(closes_history)
+            
+            # 3. Tính độ biến động H1 (High - Low)
+            h1_move = float(current['high']) - float(current['low'])
 
-def get_gold_binance_full():
-    try:
-        r = requests.get("https://api.binance.com/api/v3/ticker/24hr?symbol=PAXGUSDT", timeout=5).json()
-        tech = get_gold_binance_tech()
-        return {'p': float(r['lastPrice']), 'c': float(r['priceChange']), 'pct': float(r['priceChangePercent']), 'h1': tech['h1'], 'rsi': tech['rsi'], 'src': 'Binance (Backup)'}
-    except: return None
+            return {
+                'p': price, 
+                'c': change, 
+                'pct': percent, 
+                'h1': h1_move, 
+                'rsi': rsi, 
+                'src': 'API TwelveData' # Nguồn chuẩn
+            }
+    except Exception as e:
+        print(f"Lỗi Gold API: {e}")
+        pass
+        
+    # Nếu lỗi, trả về giá trị cũ trong Cache để không sập Dashboard
+    if GLOBAL_CACHE['gold']['p'] > 0:
+        old_data = GLOBAL_CACHE['gold'].copy()
+        old_data['src'] = 'Old Cache (Lỗi API)'
+        return old_data
+        
+    return {'p': 0, 'c': 0, 'pct': 0, 'h1': 0, 'rsi': 50, 'src': 'Mất kết nối'}
 
 # ==============================================================================
-# 3. MACRO & SPDR
+# 3. MACRO & SPDR (GIỮ NGUYÊN CODE CŨ CỦA BẠN)
 # ==============================================================================
 def get_yahoo_data(symbol):
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
-        # Tăng range lên 10d để tránh lỗi ngày lễ
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=10d"
         r = requests.get(url, headers=headers, timeout=5)
         data = r.json()
@@ -155,10 +182,11 @@ def get_spdr_advanced():
 
         t0 = valid_values[0]['v']; d0 = valid_values[0]['d']
         t1 = valid_values[1]['v']
+        
+        change_today = t0 - t1
+        # Logic check 3 ngày liên tiếp... (Giữ nguyên)
         t2 = valid_values[2]['v'] if len(valid_values) > 2 else t1
         t3 = valid_values[3]['v'] if len(valid_values) > 3 else t2
-
-        change_today = t0 - t1
         change_1 = t1 - t2
         change_2 = t2 - t3
         
@@ -183,12 +211,14 @@ def update_macro_data():
     global GLOBAL_CACHE
     current_time = time.time()
     
+    # 1. SPDR Check
     if current_time - GLOBAL_CACHE.get('last_spdr_time', 0) > CONFIG['SPDR_CACHE_TIME']:
         spdr_res = get_spdr_advanced()
         if spdr_res:
             GLOBAL_CACHE['spdr'] = spdr_res
             GLOBAL_CACHE['last_spdr_time'] = current_time
 
+    # 2. Macro Check (Giữ nguyên logic Yahoo/Fred cũ)
     if current_time - GLOBAL_CACHE['last_success_time'] < 300: return
 
     res = get_yahoo_data("^VIX")
@@ -217,46 +247,51 @@ def update_macro_data():
     
     GLOBAL_CACHE['last_success_time'] = current_time
 
-def get_data_final():
-    gold = get_gold_forex_api()
-    if not gold: gold = get_gold_binance_full()
-    if not gold: 
-        if GLOBAL_CACHE['gold']['p'] > 0: gold = GLOBAL_CACHE['gold']
-        else: gold = {'p': 0, 'c': 0, 'pct': 0, 'h1': 0, 'rsi': 50, 'src': 'Khởi động...'}
-    try: update_macro_data()
-    except: pass
-    GLOBAL_CACHE['gold'] = gold
-    return gold, GLOBAL_CACHE
-
 # ==============================================================================
 # 4. ROUTING
 # ==============================================================================
 @app.route('/')
-def home(): return "Bot V81 - Full Armor"
+def home(): return "Bot V81 - Hybrid (Gold API + Macro Yahoo)"
 
 @app.route('/test')
 def run_test():
-    gold, macro = get_data_final()
+    # Gọi hàm mới lấy vàng
+    gold = get_gold_api_full()
+    GLOBAL_CACHE['gold'] = gold
+    
+    update_macro_data()
+    macro = GLOBAL_CACHE
+    
     d_str = macro['spdr'].get('d', 'N/A')
-    send_tele(f"🔔 TEST OK. Gold: {gold['p']}. SPDR: {macro['spdr']['v']}t ({d_str})")
+    send_tele(f"🔔 TEST OK. Gold: {gold['p']} (Src: {gold['src']}). SPDR: {macro['spdr']['v']}t ({d_str})")
     return "OK", 200
 
 @app.route('/run_check')
 def run_check():
     try:
-        gold, macro = get_data_final()
+        # 1. Lấy dữ liệu Vàng từ API MỚI
+        gold = get_gold_api_full()
+        GLOBAL_CACHE['gold'] = gold
+        
+        # 2. Lấy dữ liệu Macro (Logic cũ)
+        update_macro_data()
+        macro = GLOBAL_CACHE
+        
         alerts = []
         now = time.time()
         
-        # 1. ALERT SPDR
+        # --- CÁC LOGIC ALERT (GIỮ NGUYÊN) ---
+        
+        # ALERT SPDR
         spdr = macro['spdr']
         if spdr['is_emergency']:
             if now - last_alert_times.get('SPDR', 0) > CONFIG['ALERT_COOLDOWN']:
                 alerts.append(spdr['alert_msg'])
                 last_alert_times['SPDR'] = now
 
-        # 2. ALERT GOLD
+        # ALERT GOLD (Dựa trên dữ liệu API mới)
         if gold['p'] > 0:
+            # Logic RSI
             if gold['rsi'] > CONFIG['RSI_HIGH'] and gold['h1'] > CONFIG['RSI_PRICE_MOVE']:
                 if now - last_alert_times.get('RSI', 0) > CONFIG['ALERT_COOLDOWN']:
                     alerts.append(f"🚀 <b>SIÊU TREND TĂNG:</b> RSI {gold['rsi']:.0f} + H1 chạy {gold['h1']:.1f}$")
@@ -265,24 +300,23 @@ def run_check():
                 if now - last_alert_times.get('RSI', 0) > CONFIG['ALERT_COOLDOWN']:
                     alerts.append(f"🩸 <b>SIÊU TREND GIẢM:</b> RSI {gold['rsi']:.0f} + H1 sập {gold['h1']:.1f}$")
                     last_alert_times['RSI'] = now
+            # Logic Biến động giá
             if abs(gold['h1']) > CONFIG['GOLD_H1_LIMIT']:
                 if now - last_alert_times.get('H1', 0) > CONFIG['ALERT_COOLDOWN']:
                     alerts.append(f"🚨 <b>VÀNG SỐC:</b> H1 biến động {gold['h1']:.1f} giá")
                     last_alert_times['H1'] = now
         
-        # 3. ALERT VIX & GVZ
+        # ALERT MACRO
         if macro['vix']['p'] > CONFIG['VIX_VAL_LIMIT'] or macro['vix']['pct'] > CONFIG['VIX_PCT_LIMIT']:
              if now - last_alert_times.get('VIX', 0) > CONFIG['ALERT_COOLDOWN']:
                 alerts.append(f"⚠️ <b>VIX BÁO ĐỘNG:</b> {macro['vix']['p']:.2f}")
                 last_alert_times['VIX'] = now
                 
-        # 4. ALERT LẠM PHÁT (INF10) - ĐÃ THÊM LẠI
         if abs(macro['inf10']['c']) > CONFIG['INF_10Y_LIMIT']:
              if now - last_alert_times.get('INF', 0) > CONFIG['ALERT_COOLDOWN']:
                 alerts.append(f"🇺🇸 <b>LẠM PHÁT SỐC:</b> 10Y Breakeven đổi {macro['inf10']['c']:.3f} điểm")
                 last_alert_times['INF'] = now
 
-        # 5. ALERT FEDWATCH - ĐÃ THÊM LẠI
         if abs(macro['fed']['pct']) > CONFIG['FED_PCT_LIMIT']:
              if now - last_alert_times.get('FED', 0) > CONFIG['ALERT_COOLDOWN']:
                 alerts.append(f"🏦 <b>FED BIẾN ĐỘNG:</b> Tỷ lệ cược đổi {macro['fed']['pct']:.1f}%")
@@ -292,7 +326,7 @@ def run_check():
             send_tele(f"🔥🔥 <b>CẢNH BÁO KHẨN</b> 🔥🔥\n\n" + "\n".join(alerts))
             return "Alert Sent", 200
 
-        # DASHBOARD
+        # DASHBOARD (Giữ nguyên form cũ)
         vn_now = get_vn_time()
         is_time = vn_now.minute in [0,1,2,3,4,5,30,31,32,33,34,35]
         last_sent = GLOBAL_CACHE.get('last_dashboard_time', 0)
@@ -343,4 +377,5 @@ def run_check():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
+
 
