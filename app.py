@@ -11,14 +11,14 @@ import pytz
 app = Flask(__name__)
 
 # ==============================================================================
-# 1. CẤU HÌNH
+# 1. CẤU HÌNH (GIỮ NGUYÊN CỦA BẠN)
 # ==============================================================================
 CONFIG = {
     "TELEGRAM_TOKEN": "8309991075:AAFYyjFxQQ8CYECXPKeteeUBXQE3Mx2yfUo",
     "TELEGRAM_CHAT_ID": "5464507208",
     "TWELVE_DATA_KEY": "3d1252ab61b947bda28b0e532947ae34", 
     
-    # 1. VÀNG (Dùng API Twelve Data)
+    # 1. VÀNG
     "GOLD_H1_LIMIT": 40.0,
     "RSI_HIGH": 82, "RSI_LOW": 18, "RSI_PRICE_MOVE": 30.0,
     
@@ -57,7 +57,7 @@ def send_tele(msg):
     except: pass
 
 # ==============================================================================
-# 2. HÀM LẤY VÀNG (TWELVE DATA - GIỮ NGUYÊN CODE BẠN)
+# 2. HÀM LẤY VÀNG (GIỮ NGUYÊN CODE BẠN - TWELVE DATA)
 # ==============================================================================
 def calculate_rsi(prices, periods=14):
     if len(prices) < periods + 1: return 50
@@ -98,46 +98,41 @@ def get_gold_api_full():
     return {'p': 0, 'c': 0, 'pct': 0, 'h1': 0, 'rsi': 50, 'src': 'Mất kết nối'}
 
 # ==============================================================================
-# 3. HÀM YAHOO (ĐÃ SỬA CHO KHỎE HƠN)
+# 3. HÀM YAHOO ĐÃ FIX (KHÔNG DÙNG THƯ VIỆN NỮA)
 # ==============================================================================
 def get_yahoo_data(symbol):
     """
-    Đã sửa: Thêm Random User-Agent và Fallback server để tránh bị chặn.
+    SỬA LỖI: Dùng requests trực tiếp thay vì yfinance.
+    Tránh lỗi 429 và Database Locked trên Render.
     """
-    uas = [
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/605.1.15',
-        'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15'
-    ]
-    
-    # Thử query1 trước, nếu lỗi thử query2
-    hosts = ["query1.finance.yahoo.com", "query2.finance.yahoo.com"]
-    
-    for host in hosts:
-        try:
-            headers = {"User-Agent": random.choice(uas)}
-            url = f"https://{host}/v8/finance/chart/{symbol}?interval=1d&range=5d"
-            r = requests.get(url, headers=headers, timeout=5)
-            
-            if r.status_code == 200:
-                data = r.json()
-                # Kiểm tra cấu trúc JSON
-                if 'chart' in data and 'result' in data['chart']:
-                    res = data['chart']['result'][0]
-                    if 'indicators' in res and 'quote' in res['indicators']:
-                        quote = res['indicators']['quote'][0]
-                        if 'close' in quote:
-                            closes = [c for c in quote['close'] if c is not None]
-                            if len(closes) >= 2:
-                                cur = closes[-1]
-                                prev = closes[-2]
-                                return cur, cur - prev, (cur - prev)/prev*100
-        except: continue
+    try:
+        # Header giả lập để Yahoo không chặn
+        uas = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15'
+        ]
+        headers = {"User-Agent": random.choice(uas)}
         
+        # Gọi API JSON trực tiếp
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=5d"
+        r = requests.get(url, headers=headers, timeout=5)
+        data = r.json()
+        
+        # Bóc tách dữ liệu
+        result = data['chart']['result'][0]
+        quote = result['indicators']['quote'][0]
+        closes = [c for c in quote['close'] if c is not None]
+        
+        if len(closes) >= 2:
+            cur = closes[-1]
+            prev = closes[-2]
+            return cur, cur - prev, (cur - prev)/prev*100
+            
+    except: return None
     return None
 
 # ==============================================================================
-# 4. CÁC HÀM KHÁC (FRED & SPDR - GIỮ NGUYÊN CODE BẠN)
+# 4. FRED & SPDR (GIỮ NGUYÊN CODE BẠN)
 # ==============================================================================
 def get_fred_data(sid):
     try:
@@ -167,26 +162,26 @@ def get_spdr_advanced():
         valid_values = [] 
         for row in reversed(rows):
             date_str = row[0]
-            found_tonnes = 0.0
-            for item in row:
-                try:
-                    val = float(item.replace(',', ''))
-                    if 600 < val < 2000: 
-                        found_tonnes = val
-                        break
-                except: continue
-            if found_tonnes > 0:
-                valid_values.append({'d': date_str, 'v': found_tonnes})
-            if len(valid_values) >= 4: break
+            try:
+                val = float(row[10].replace(',', '')) # Cột Tonnes thường ở index 10
+                valid_values.append({'d': date_str, 'v': val})
+            except: 
+                # Fallback tìm cột nếu index lệch
+                for item in row:
+                    try:
+                        v = float(item.replace(',', ''))
+                        if 600 < v < 2000: 
+                            valid_values.append({'d': date_str, 'v': v})
+                            break
+                    except: continue
+            if len(valid_values) >= 2: break
         
-        if len(valid_values) < 2:
-            return {'v': 0, 'c': 0, 'd': '', 'alert_msg': '', 'is_emergency': False}
+        if len(valid_values) < 2: return None
 
         t0 = valid_values[0]['v']; d0 = valid_values[0]['d']
         t1 = valid_values[1]['v']
         change_today = t0 - t1
         
-        # Check logic alert SPDR
         alert_msg = ""
         is_emergency = False
         if abs(change_today) >= 5.0:
@@ -201,12 +196,14 @@ def update_macro_data():
     global GLOBAL_CACHE
     current_time = time.time()
     
+    # SPDR Check
     if current_time - GLOBAL_CACHE.get('last_spdr_time', 0) > CONFIG['SPDR_CACHE_TIME']:
         spdr_res = get_spdr_advanced()
         if spdr_res:
             GLOBAL_CACHE['spdr'] = spdr_res
             GLOBAL_CACHE['last_spdr_time'] = current_time
 
+    # Macro Check
     if current_time - GLOBAL_CACHE['last_success_time'] < 300: return
 
     res = get_yahoo_data("^VIX")
@@ -224,7 +221,7 @@ def update_macro_data():
             GLOBAL_CACHE['be_source'] = "Lạm phát (Yahoo)"
             GLOBAL_CACHE['inf10'] = {'p': res10[0], 'c': res10[1]}
 
-    res05 = get_yahoo_data("^T5YIE")
+    res05 = get_yahoo_data("^T5YIE") # Fallback nếu FRED lỗi
     if res05: GLOBAL_CACHE['inf05'] = {'p': res05[0], 'c': res05[1]}
     else:
         fred05 = get_fred_data("T5YIE")
@@ -239,7 +236,7 @@ def update_macro_data():
 # 5. ROUTING
 # ==============================================================================
 @app.route('/')
-def home(): return "Bot V84 - User Code Base + Fixed Yahoo"
+def home(): return "Bot V86 - Fixed Yahoo Source"
 
 @app.route('/test')
 def run_test():
@@ -247,9 +244,8 @@ def run_test():
     GLOBAL_CACHE['gold'] = gold
     update_macro_data()
     macro = GLOBAL_CACHE
-    
     d_str = macro['spdr'].get('d', 'N/A')
-    send_tele(f"🔔 TEST OK.\nGold: {gold['p']}\nSrc: {gold['src']}\nSPDR: {macro['spdr']['v']}t ({d_str})")
+    send_tele(f"🔔 TEST OK.\nGold: {gold['p']} ({gold['src']})\nSPDR: {macro['spdr']['v']}t")
     return "OK", 200
 
 @app.route('/run_check')
@@ -349,9 +345,7 @@ def run_check():
             return "Report Sent", 200
 
         return "Checked", 200
-    except Exception as e: 
-        print(f"Error: {e}")
-        return f"Err: {e}", 200
+    except: return "Err", 200
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
