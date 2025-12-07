@@ -6,11 +6,12 @@ import time
 import random
 from datetime import datetime, timedelta
 import pytz
+import json
 
 app = Flask(__name__)
 
 # ==============================================================================
-# 1. CẤU HÌNH (TWELVE DATA KEY CỦA BẠN)
+# 1. CẤU HÌNH
 # ==============================================================================
 CONFIG = {
     "TELEGRAM_TOKEN": "8309991075:AAFYyjFxQQ8CYECXPKeteeUBXQE3Mx2yfUo",
@@ -21,12 +22,15 @@ CONFIG = {
     "GOLD_H1_LIMIT": 40.0,
     "RSI_HIGH": 82, "RSI_LOW": 18, "RSI_PRICE_MOVE": 30.0,
     
-    # CẢNH BÁO BIẾN ĐỘNG
+    # CẢNH BÁO VĨ MÔ
     "VIX_VAL_LIMIT": 30, "VIX_PCT_LIMIT": 15.0,
     "GVZ_VAL_LIMIT": 25, "GVZ_PCT_LIMIT": 10.0,
     "MOVE_PCT_LIMIT": 5.0,
     
-    "ALERT_COOLDOWN": 3600
+    "ALERT_COOLDOWN": 3600,
+    
+    # CẤU HÌNH TIN TỨC
+    "NEWS_CACHE_TIME": 14400 # 4 Tiếng cập nhật lịch tin 1 lần (Siêu an toàn)
 }
 
 GLOBAL_CACHE = {
@@ -34,7 +38,9 @@ GLOBAL_CACHE = {
     'vix': {'p': 0, 'c': 0, 'pct': 0},
     'gvz': {'p': 0, 'c': 0, 'pct': 0},
     'move': {'p': 0, 'c': 0, 'pct': 0},
+    'news': [], # Cache tin tức
     'last_success_time': 0,
+    'last_news_time': 0, # Thời gian cập nhật tin cuối cùng
     'last_dashboard_time': 0
 }
 
@@ -49,7 +55,74 @@ def send_tele(msg):
     except: pass
 
 # ==============================================================================
-# 2. HÀM LẤY VÀNG (TWELVE DATA)
+# 2. HÀM LẤY TIN TỨC FOREXFACTORY (JSON BACKDOOR)
+# ==============================================================================
+def get_forex_news():
+    """
+    Lấy lịch tin từ nguồn JSON của FairEconomy (ForexFactory).
+    Lọc: USD + High Impact + Sắp diễn ra.
+    """
+    try:
+        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Referer": "https://www.forexfactory.com/"
+        }
+        r = requests.get(url, headers=headers, timeout=10)
+        data = r.json()
+        
+        upcoming = []
+        # Lấy thời gian hiện tại theo UTC (để so sánh với file json)
+        now_utc = datetime.utcnow().replace(tzinfo=pytz.utc)
+        
+        for item in data:
+            # 1. Lọc USD và Tin Đỏ (High)
+            if item['country'] == 'USD' and item['impact'] == 'High':
+                try:
+                    # 2. Xử lý thời gian (Format: 2025-11-26T10:00:00-05:00)
+                    # Dùng cách cắt chuỗi cơ bản để không cần thư viện dateutil nặng nề
+                    raw_date = item['date']
+                    # Cắt lấy phần ngày giờ cơ bản: 2025-11-26T10:00:00
+                    dt_str = raw_date.rsplit('-', 1)[0] if '-' in raw_date[-6:] else raw_date.rsplit('+', 1)[0]
+                    news_dt = datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%S")
+                    
+                    # Giả định offset từ chuỗi gốc (thường là -04:00 hoặc -05:00)
+                    # Để đơn giản và an toàn, ta convert sang VN luôn
+                    # FF JSON thường là giờ New York. Ta cứ +12 tiếng là ra giờ VN xấp xỉ, 
+                    # hoặc chuẩn hơn là parse timezone.
+                    # Cách chuẩn nhất không cần thư viện ngoài:
+                    # Lấy offset từ chuỗi cuối (ví dụ -05:00)
+                    offset_str = raw_date[-6:]
+                    sign = 1 if offset_str[0] == '+' else -1
+                    hours = int(offset_str[1:3])
+                    minutes = int(offset_str[4:6])
+                    offset_delta = timedelta(hours=hours, minutes=minutes) * sign
+                    
+                    # Convert về UTC
+                    news_utc = news_dt - offset_delta
+                    news_utc = news_utc.replace(tzinfo=pytz.utc)
+                    
+                    # 3. Chỉ lấy tin TƯƠNG LAI (Trong vòng 24h tới)
+                    # Hoặc tin vừa ra cách đây 1 tiếng (để biết lý do chạy)
+                    time_diff = (news_utc - now_utc).total_seconds()
+                    
+                    if -3600 < time_diff < 86400: # Từ -1h đến +24h
+                        # Convert ra giờ Việt Nam (UTC+7)
+                        news_vn = news_utc + timedelta(hours=7)
+                        time_str = news_vn.strftime('%H:%M') # Chỉ lấy giờ phút
+                        title = item['title']
+                        upcoming.append(f"• <b>{time_str}:</b> {title}")
+                        
+                except: continue
+                
+        # Sắp xếp và lấy 3 tin gần nhất
+        return upcoming[:5]
+    except Exception as e:
+        print(f"News Error: {e}")
+        return []
+
+# ==============================================================================
+# 3. HÀM LẤY VÀNG (TWELVE DATA)
 # ==============================================================================
 def calculate_rsi(prices, periods=14):
     if len(prices) < periods + 1: return 50
@@ -60,7 +133,7 @@ def calculate_rsi(prices, periods=14):
     rsi = 100 - (100 / (1 + rs))
     return float(rsi.iloc[-1])
 
-def get_gold_forex_api():
+def get_gold_api():
     try:
         url = f"https://api.twelvedata.com/quote?symbol=XAU/USD&apikey={CONFIG['TWELVE_DATA_KEY']}"
         r = requests.get(url, timeout=10)
@@ -80,34 +153,14 @@ def get_gold_forex_api():
             return {'p': float(d['close']), 'c': float(d['change']), 'pct': float(d['percent_change']), 'h1': h1_move, 'rsi': rsi, 'src': 'API Forex'}
     except: pass
     
-    # Fallback
-    return get_gold_binance_backup()
-
-def get_gold_binance_backup():
-    try:
-        r = requests.get("https://api.binance.com/api/v3/ticker/24hr?symbol=PAXGUSDT", timeout=5).json()
-        k = requests.get("https://api.binance.com/api/v3/klines?symbol=PAXGUSDT&interval=1h&limit=20", timeout=5).json()
-        closes = [float(x[4]) for x in k]
-        rsi = calculate_rsi(closes)
-        last = k[-1]
-        h1 = float(last[2]) - float(last[3])
-        return {'p': float(r['lastPrice']), 'c': float(r['priceChange']), 'pct': float(r['priceChangePercent']), 'h1': h1, 'rsi': rsi, 'src': 'Binance (Backup)'}
-    except: return None
-
-def get_gold_final():
-    gold = get_gold_forex_api()
-    if not gold: gold = get_gold_binance_full()
-    if not gold:
-        if GLOBAL_CACHE['gold']['p'] > 0: gold = GLOBAL_CACHE['gold']
-        else: gold = {'p': 0, 'c': 0, 'pct': 0, 'h1': 0, 'rsi': 50, 'src': 'Mất kết nối'}
-    GLOBAL_CACHE['gold'] = gold
-    return gold
-
-def get_gold_binance_full(): # Helper for backup
-    return get_gold_binance_backup()
+    if GLOBAL_CACHE['gold']['p'] > 0:
+        old = GLOBAL_CACHE['gold'].copy()
+        old['src'] = "Mất kết nối (Giá cũ)"
+        return old
+    return {'p': 0, 'c': 0, 'pct': 0, 'h1': 0, 'rsi': 50, 'src': 'Lỗi API'}
 
 # ==============================================================================
-# 3. MACRO (YAHOO VIX/GVZ/MOVE)
+# 4. MACRO (YAHOO)
 # ==============================================================================
 def get_yahoo_data(symbol):
     try:
@@ -124,6 +177,14 @@ def get_yahoo_data(symbol):
 def update_macro_data():
     global GLOBAL_CACHE
     current_time = time.time()
+    
+    # 1. CẬP NHẬT TIN TỨC (4 TIẾNG/LẦN)
+    if current_time - GLOBAL_CACHE['last_news_time'] > CONFIG['NEWS_CACHE_TIME']:
+        news_list = get_forex_news()
+        if news_list: GLOBAL_CACHE['news'] = news_list
+        GLOBAL_CACHE['last_news_time'] = current_time
+
+    # 2. CẬP NHẬT CHỈ SỐ (5 PHÚT/LẦN)
     if current_time - GLOBAL_CACHE['last_success_time'] < 300: return
 
     res = get_yahoo_data("^VIX")
@@ -135,30 +196,33 @@ def update_macro_data():
     
     GLOBAL_CACHE['last_success_time'] = current_time
 
+def get_data_final():
+    gold = get_gold_api()
+    GLOBAL_CACHE['gold'] = gold
+    try: update_macro_data()
+    except: pass
+    return gold, GLOBAL_CACHE
+
 # ==============================================================================
-# 4. ROUTING & RUN
+# 5. ROUTING & RUN
 # ==============================================================================
 @app.route('/')
-def home(): return "Bot V96 - Dashboard Fix"
+def home(): return "Bot V97 - News Alert"
 
 @app.route('/test')
 def run_test():
-    gold = get_gold_final()
+    gold, _ = get_data_final()
     send_tele(f"🔔 TEST OK. Gold: {gold['p']} ({gold['src']})")
     return "OK", 200
 
 @app.route('/run_check')
 def run_check():
     try:
-        gold = get_gold_final()
-        try: update_macro_data()
-        except: pass
-        
-        macro = GLOBAL_CACHE
+        gold, macro = get_data_final()
         alerts = []
         now = time.time()
         
-        # --- CẢNH BÁO VÀNG ---
+        # --- CẢNH BÁO ---
         if gold['p'] > 0:
             if gold['rsi'] > CONFIG['RSI_HIGH'] and gold['h1'] > CONFIG['RSI_PRICE_MOVE']:
                 if now - last_alert_times.get('RSI', 0) > CONFIG['ALERT_COOLDOWN']:
@@ -173,10 +237,9 @@ def run_check():
                     alerts.append(f"🚨 <b>VÀNG SỐC:</b> H1 biến động {gold['h1']:.1f} giá")
                     last_alert_times['H1'] = now
 
-        # --- CẢNH BÁO BIẾN ĐỘNG ---
         if macro['move']['pct'] > CONFIG['MOVE_PCT_LIMIT']:
              if now - last_alert_times.get('MOVE', 0) > CONFIG['ALERT_COOLDOWN']:
-                alerts.append(f"🌋 <b>MOVE SỐC:</b> +{macro['move']['pct']:.2f}% (Bão Trái Phiếu)")
+                alerts.append(f"🌋 <b>MOVE SỐC:</b> +{macro['move']['pct']:.2f}%")
                 last_alert_times['MOVE'] = now
         if macro['vix']['p'] > CONFIG['VIX_VAL_LIMIT'] or macro['vix']['pct'] > CONFIG['VIX_PCT_LIMIT']:
              if now - last_alert_times.get('VIX', 0) > CONFIG['ALERT_COOLDOWN']:
@@ -191,32 +254,36 @@ def run_check():
             send_tele(f"🔥🔥 <b>CẢNH BÁO KHẨN</b> 🔥🔥\n\n" + "\n".join(alerts))
             return "Alert Sent", 200
 
-        # --- DASHBOARD (SỬA LỖI GỬI TRÙNG) ---
+        # --- DASHBOARD ---
         vn_now = get_vn_time()
-        
-        # Chỉ gửi vào phút 00, 01 hoặc 30, 31 (Cắt bỏ phút 02, 03... để tránh bot thức dậy muộn gửi bồi)
-        is_time = vn_now.minute in [0, 1, 30, 31]
+        is_time = vn_now.minute in [0,1,2,3,4,5,30,31,32,33,34,35]
         last_sent = GLOBAL_CACHE.get('last_dashboard_time', 0)
         
-        if is_time and (now - last_sent > 1200): # Cách lần gửi trước ít nhất 20 phút
+        if is_time and (now - last_sent > 1200):
             def s(v): return "+" if v >= 0 else ""
             def i(v): return "🟢" if v >= 0 else "🔴"
             def fmt(val, chg, pct): return f"{val:.2f} ({s(pct)}{pct:.2f}%)" if val else "N/A"
             gold_p = f"{gold['p']:.1f}" if gold['p'] > 0 else "N/A"
+            
+            # Format tin tức (Nếu có)
+            news_section = ""
+            if macro['news']:
+                news_txt = "\n".join(macro['news'])
+                news_section = f"📰 <b>TIN ĐỎ USD (24H):</b>\n{news_txt}\n-------------------------------\n"
 
             msg = (
                 f"📊 <b>MARKET DASHBOARD (D1)</b>\n"
                 f"Time: {vn_now.strftime('%H:%M')}\n"
-                f"Nguồn Vàng: {gold['src']}\n"
                 f"-------------------------------\n"
+                f"{news_section}"
                 f"🥇 <b>GOLD (XAU/USD):</b> {gold_p}\n"
                 f"   {i(gold['c'])} {s(gold['c'])}{gold['c']:.1f}$ ({s(gold['pct'])}{gold['pct']:.2f}%)\n"
                 f"   🎯 <b>RSI (H1):</b> {gold['rsi']:.1f}\n"
                 f"-------------------------------\n"
-                f"📉 <b>Risk Sentiment (Nỗi sợ):</b>\n"
-                f"   • VIX (CK): {fmt(macro['vix']['p'], macro['vix']['c'], macro['vix']['pct'])}\n"
-                f"   • GVZ (Vàng): {fmt(macro['gvz']['p'], macro['gvz']['c'], macro['gvz']['pct'])}\n"
-                f"   • MOVE (Bond): {fmt(macro['move']['p'], macro['move']['c'], macro['move']['pct'])}\n"
+                f"📉 <b>Risk Sentiment:</b>\n"
+                f"   • VIX: {fmt(macro['vix']['p'], macro['vix']['c'], macro['vix']['pct'])}\n"
+                f"   • GVZ: {fmt(macro['gvz']['p'], macro['gvz']['c'], macro['gvz']['pct'])}\n"
+                f"   • MOVE: {fmt(macro['move']['p'], macro['move']['c'], macro['move']['pct'])}\n"
             )
             send_tele(msg)
             GLOBAL_CACHE['last_dashboard_time'] = now
