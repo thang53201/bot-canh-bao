@@ -10,18 +10,20 @@ import pytz
 app = Flask(__name__)
 
 # ==============================================================================
-# 1. CẤU HÌNH (GỌN NHẸ)
+# 1. CẤU HÌNH (TWELVE DATA ONLY)
 # ==============================================================================
 CONFIG = {
     "TELEGRAM_TOKEN": "8309991075:AAFYyjFxQQ8CYECXPKeteeUBXQE3Mx2yfUo",
     "TELEGRAM_CHAT_ID": "5464507208",
+    
+    # API KEY CỦA BẠN (QUAN TRỌNG)
     "TWELVE_DATA_KEY": "3d1252ab61b947bda28b0e532947ae34", 
     
     # CẢNH BÁO VÀNG
     "GOLD_H1_LIMIT": 40.0,
     "RSI_HIGH": 82, "RSI_LOW": 18, "RSI_PRICE_MOVE": 30.0,
     
-    # CẢNH BÁO BIẾN ĐỘNG
+    # CẢNH BÁO VĨ MÔ
     "VIX_VAL_LIMIT": 30, "VIX_PCT_LIMIT": 15.0,
     "GVZ_VAL_LIMIT": 25, "GVZ_PCT_LIMIT": 10.0,
     "MOVE_PCT_LIMIT": 5.0,
@@ -49,7 +51,7 @@ def send_tele(msg):
     except: pass
 
 # ==============================================================================
-# 2. HÀM LẤY VÀNG (TWELVE DATA)
+# 2. HÀM LẤY VÀNG (CHỈ DÙNG TWELVE DATA)
 # ==============================================================================
 def calculate_rsi(prices, periods=14):
     if len(prices) < periods + 1: return 50
@@ -60,50 +62,69 @@ def calculate_rsi(prices, periods=14):
     rsi = 100 - (100 / (1 + rs))
     return float(rsi.iloc[-1])
 
-def get_gold_forex_api():
+def get_gold_exclusive():
+    """
+    Chỉ dùng API Twelve Data.
+    Lấy giá (Quote) và nến H1 (Time Series) để tính RSI/Biên độ.
+    """
     try:
-        # Lấy giá
-        url = f"https://api.twelvedata.com/quote?symbol=XAU/USD&apikey={CONFIG['TWELVE_DATA_KEY']}"
-        r = requests.get(url, timeout=10)
-        d = r.json()
+        # 1. Lấy giá hiện tại
+        url_quote = f"https://api.twelvedata.com/quote?symbol=XAU/USD&apikey={CONFIG['TWELVE_DATA_KEY']}"
+        r_quote = requests.get(url_quote, timeout=15)
+        d_quote = r_quote.json()
         
-        if 'close' in d:
-            # Lấy nến H1
-            url2 = f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=1h&outputsize=20&apikey={CONFIG['TWELVE_DATA_KEY']}"
-            r2 = requests.get(url2, timeout=10)
-            d2 = r2.json()
+        # 2. Lấy nến lịch sử (để tính RSI & H1 Range)
+        url_series = f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=1h&outputsize=20&apikey={CONFIG['TWELVE_DATA_KEY']}"
+        r_series = requests.get(url_series, timeout=15)
+        d_series = r_series.json()
+        
+        if 'close' in d_quote and 'values' in d_series:
+            # Xử lý giá
+            price = float(d_quote['close'])
+            change = float(d_quote['change'])
+            percent = float(d_quote['percent_change'])
             
-            h1_move = 0
-            rsi = 50
+            # Xử lý kỹ thuật
+            candles = d_series['values']
+            # Đảo ngược mảng để tính RSI (Cũ -> Mới)
+            closes_history = [float(c['close']) for c in candles][::-1]
+            rsi = calculate_rsi(closes_history)
             
-            if 'values' in d2:
-                candles = d2['values']
-                # RSI
-                closes = [float(c['close']) for c in candles][::-1]
-                rsi = calculate_rsi(closes)
-                # H1
-                current = candles[0]
-                h1_move = float(current['high']) - float(current['low'])
+            # Tính H1 Range (Nến mới nhất)
+            current_candle = candles[0]
+            h1_move = float(current_candle['high']) - float(current_candle['low'])
 
-            return {'p': float(d['close']), 'c': float(d['change']), 'pct': float(d['percent_change']), 'h1': h1_move, 'rsi': rsi, 'src': 'API Forex'}
-    except: pass
+            return {
+                'p': price, 
+                'c': change, 
+                'pct': percent, 
+                'h1': h1_move, 
+                'rsi': rsi, 
+                'src': 'TwelveData (Forex)'
+            }
+    except Exception as e:
+        print(f"API Error: {e}")
+        pass
+        
+    return None # Lỗi là trả về None, không gọi backup
+
+def get_gold_final():
+    # Gọi hàm độc quyền
+    gold = get_gold_exclusive()
     
-    # Fallback Binance
-    return get_gold_binance_backup()
+    if gold:
+        GLOBAL_CACHE['gold'] = gold
+    else:
+        # Nếu lỗi: Dùng lại Cache cũ (nếu có)
+        if GLOBAL_CACHE['gold']['p'] > 0:
+            GLOBAL_CACHE['gold']['src'] = "Mất kết nối (Dữ liệu cũ)"
+        else:
+            GLOBAL_CACHE['gold'] = {'p': 0, 'c': 0, 'pct': 0, 'h1': 0, 'rsi': 50, 'src': 'Lỗi API'}
 
-def get_gold_binance_backup():
-    try:
-        r = requests.get("https://api.binance.com/api/v3/ticker/24hr?symbol=PAXGUSDT", timeout=5).json()
-        k = requests.get("https://api.binance.com/api/v3/klines?symbol=PAXGUSDT&interval=1h&limit=20", timeout=5).json()
-        closes = [float(x[4]) for x in k]
-        rsi = calculate_rsi(closes)
-        last = k[-1]
-        h1 = float(last[2]) - float(last[3])
-        return {'p': float(r['lastPrice']), 'c': float(r['priceChange']), 'pct': float(r['priceChangePercent']), 'h1': h1, 'rsi': rsi, 'src': 'Binance (Backup)'}
-    except: return None
+    return GLOBAL_CACHE['gold']
 
 # ==============================================================================
-# 3. MACRO (VIX, GVZ, MOVE - YAHOO)
+# 3. HÀM LẤY VĨ MÔ (YAHOO 5 PHÚT/LẦN)
 # ==============================================================================
 def get_yahoo_data(symbol):
     try:
@@ -121,47 +142,44 @@ def update_macro_data():
     global GLOBAL_CACHE
     current_time = time.time()
     
+    # 5 phút cập nhật 1 lần
     if current_time - GLOBAL_CACHE['last_success_time'] < 300: return
 
     res = get_yahoo_data("^VIX")
     if res: GLOBAL_CACHE['vix'] = {'p': res[0], 'c': res[1], 'pct': res[2]}
+    
     res = get_yahoo_data("^GVZ")
     if res: GLOBAL_CACHE['gvz'] = {'p': res[0], 'c': res[1], 'pct': res[2]}
+    
     res = get_yahoo_data("^MOVE")
     if res: GLOBAL_CACHE['move'] = {'p': res[0], 'c': res[1], 'pct': res[2]}
     
     GLOBAL_CACHE['last_success_time'] = current_time
 
-def get_data_final():
-    gold = get_gold_forex_api()
-    if not gold:
-        if GLOBAL_CACHE['gold']['p'] > 0: gold = GLOBAL_CACHE['gold']
-        else: gold = {'p': 0, 'c': 0, 'pct': 0, 'h1': 0, 'rsi': 50, 'src': 'Mất kết nối'}
-    GLOBAL_CACHE['gold'] = gold
-    try: update_macro_data()
-    except: pass
-    return gold, GLOBAL_CACHE
-
 # ==============================================================================
-# 4. ROUTING
+# 4. ROUTING & RUN
 # ==============================================================================
 @app.route('/')
-def home(): return "Bot V93 - Clean & Mean"
+def home(): return "Bot V94 - Twelve Data Only"
 
 @app.route('/test')
 def run_test():
-    gold, _ = get_data_final()
+    gold = get_gold_final()
     send_tele(f"🔔 TEST OK. Gold: {gold['p']} ({gold['src']})")
     return "OK", 200
 
 @app.route('/run_check')
 def run_check():
     try:
-        gold, macro = get_data_final()
+        gold = get_gold_final() # Lấy Vàng
+        try: update_macro_data() # Lấy Macro
+        except: pass
+        
+        macro = GLOBAL_CACHE
         alerts = []
         now = time.time()
         
-        # ALERT VÀNG
+        # --- CẢNH BÁO VÀNG ---
         if gold['p'] > 0:
             if gold['rsi'] > CONFIG['RSI_HIGH'] and gold['h1'] > CONFIG['RSI_PRICE_MOVE']:
                 if now - last_alert_times.get('RSI', 0) > CONFIG['ALERT_COOLDOWN']:
@@ -176,25 +194,27 @@ def run_check():
                     alerts.append(f"🚨 <b>VÀNG SỐC:</b> H1 biến động {gold['h1']:.1f} giá")
                     last_alert_times['H1'] = now
 
-        # ALERT MACRO (VIX, GVZ, MOVE)
-        if macro['vix']['p'] > CONFIG['VIX_VAL_LIMIT'] or macro['vix']['pct'] > CONFIG['VIX_PCT_LIMIT']:
-             if now - last_alert_times.get('VIX', 0) > CONFIG['ALERT_COOLDOWN']:
-                alerts.append(f"⚠️ <b>VIX BÁO ĐỘNG:</b> {macro['vix']['p']:.2f}")
-                last_alert_times['VIX'] = now
-        if macro['gvz']['p'] > CONFIG['GVZ_VAL_LIMIT'] or macro['gvz']['pct'] > CONFIG['GVZ_PCT_LIMIT']:
-             if now - last_alert_times.get('GVZ', 0) > CONFIG['ALERT_COOLDOWN']:
-                alerts.append(f"🌪 <b>GVZ BÁO ĐỘNG:</b> {macro['gvz']['p']:.2f}")
-                last_alert_times['GVZ'] = now
+        # --- CẢNH BÁO BIẾN ĐỘNG ---
         if macro['move']['pct'] > CONFIG['MOVE_PCT_LIMIT']:
              if now - last_alert_times.get('MOVE', 0) > CONFIG['ALERT_COOLDOWN']:
                 alerts.append(f"🌋 <b>MOVE SỐC:</b> +{macro['move']['pct']:.2f}%")
                 last_alert_times['MOVE'] = now
 
+        if macro['vix']['p'] > CONFIG['VIX_VAL_LIMIT'] or macro['vix']['pct'] > CONFIG['VIX_PCT_LIMIT']:
+             if now - last_alert_times.get('VIX', 0) > CONFIG['ALERT_COOLDOWN']:
+                alerts.append(f"⚠️ <b>VIX BÁO ĐỘNG:</b> {macro['vix']['p']:.2f}")
+                last_alert_times['VIX'] = now
+        
+        if macro['gvz']['p'] > CONFIG['GVZ_VAL_LIMIT'] or macro['gvz']['pct'] > CONFIG['GVZ_PCT_LIMIT']:
+             if now - last_alert_times.get('GVZ', 0) > CONFIG['ALERT_COOLDOWN']:
+                alerts.append(f"🌪 <b>GVZ BÁO ĐỘNG:</b> {macro['gvz']['p']:.2f}")
+                last_alert_times['GVZ'] = now
+
         if alerts:
             send_tele(f"🔥🔥 <b>CẢNH BÁO KHẨN</b> 🔥🔥\n\n" + "\n".join(alerts))
             return "Alert Sent", 200
 
-        # DASHBOARD
+        # --- DASHBOARD ---
         vn_now = get_vn_time()
         is_time = vn_now.minute in [0,1,2,3,4,5,30,31,32,33,34,35]
         last_sent = GLOBAL_CACHE.get('last_dashboard_time', 0)
