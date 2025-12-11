@@ -11,33 +11,40 @@ from dateutil import parser
 app = Flask(__name__)
 
 # ==============================================================================
-# 1. CẤU HÌNH
+# 1. CẤU HÌNH (ĐÃ THÊM NGƯỠNG CẢNH BÁO MỚI)
 # ==============================================================================
 CONFIG = {
     "TELEGRAM_TOKEN": "8309991075:AAFYyjFxQQ8CYECXPKeteeUBXQE3Mx2yfUo",
     "TELEGRAM_CHAT_ID": "5464507208",
     "TWELVE_DATA_KEY": "3d1252ab61b947bda28b0e532947ae34", 
     
-    # CẢNH BÁO
+    # CẢNH BÁO VÀNG
     "GOLD_H1_LIMIT": 40.0,
     "RSI_HIGH": 82, "RSI_LOW": 18, "RSI_PRICE_MOVE": 30.0,
+    
+    # CẢNH BÁO BIẾN ĐỘNG (1 ngày)
     "VIX_VAL_LIMIT": 30, "VIX_PCT_LIMIT": 15.0,
     "GVZ_VAL_LIMIT": 25, "GVZ_PCT_LIMIT": 10.0,
     "MOVE_PCT_LIMIT": 5.0,
     
+    # CẢNH BÁO BIẾN ĐỘNG (ĐA NGÀY - MỚI)
+    "MOVE_3D_LIMIT": 10.0, # MOVE tăng tổng > 10% trong 3 ngày
+    "GVZ_2D_LIMIT": 10.0,  # GVZ tăng tổng > 10% trong 2 ngày
+    
     "ALERT_COOLDOWN": 3600,
-    "NEWS_CACHE_TIME": 14400, # 4 Tiếng
-    "GOLD_CACHE_TIME": 120    # 2 Phút (Mới)
+    "NEWS_CACHE_TIME": 3600, 
+    "GOLD_CACHE_TIME": 120
 }
 
 GLOBAL_CACHE = {
     'gold': {'p': 0, 'c': 0, 'pct': 0, 'h1': 0, 'rsi': 50, 'src': 'Khởi động...'},
-    'vix': {'p': 0, 'c': 0, 'pct': 0},
-    'gvz': {'p': 0, 'c': 0, 'pct': 0},
-    'move': {'p': 0, 'c': 0, 'pct': 0},
+    # Các cache vĩ mô giờ sẽ chứa thêm pct_2d, pct_3d
+    'vix': {'p': 0, 'c': 0, 'pct': 0, 'pct_2d': 0, 'pct_3d': 0},
+    'gvz': {'p': 0, 'c': 0, 'pct': 0, 'pct_2d': 0, 'pct_3d': 0},
+    'move': {'p': 0, 'c': 0, 'pct': 0, 'pct_2d': 0, 'pct_3d': 0},
     'news': [],
-    'last_success_time': 0,      # Thời gian update Macro
-    'last_gold_time': 0,         # Thời gian update Vàng (Mới)
+    'last_success_time': 0,
+    'last_gold_time': 0,
     'last_news_time': 0,
     'last_dashboard_time': 0
 }
@@ -53,7 +60,7 @@ def send_tele(msg):
     except: pass
 
 # ==============================================================================
-# 2. HÀM LẤY VÀNG (TWELVE DATA - 2 PHÚT/LẦN)
+# 2. HÀM LẤY VÀNG (GIỮ NGUYÊN)
 # ==============================================================================
 def calculate_rsi_safe(prices, period=14):
     clean_prices = [p for p in prices if p > 0]
@@ -99,19 +106,14 @@ def get_gold_api():
 def update_gold_data():
     global GLOBAL_CACHE
     current_time = time.time()
-    
-    # Chỉ gọi API nếu đã qua 2 phút (120 giây)
-    if current_time - GLOBAL_CACHE['last_gold_time'] < CONFIG['GOLD_CACHE_TIME']:
-        return
-
+    if current_time - GLOBAL_CACHE['last_gold_time'] < CONFIG['GOLD_CACHE_TIME']: return
     new_gold = get_gold_api()
-    # Chỉ cập nhật nếu lấy được dữ liệu mới (không phải lỗi)
     if new_gold['src'] != 'Lỗi API':
         GLOBAL_CACHE['gold'] = new_gold
         GLOBAL_CACHE['last_gold_time'] = current_time
 
 # ==============================================================================
-# 3. MACRO & TIN TỨC (GIỮ NGUYÊN)
+# 3. MACRO & TIN TỨC (SỬA HÀM YAHOO ĐỂ TÍNH 2D, 3D)
 # ==============================================================================
 def get_ff_news():
     try:
@@ -129,29 +131,55 @@ def get_ff_news():
                     news_dt = datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%S")
                     offset_str = raw_date[-6:]
                     sign = 1 if offset_str[0] == '+' else -1
-                    hours = int(offset_str[1:3])
-                    minutes = int(offset_str[4:6])
+                    hours = int(offset_str[1:3]); minutes = int(offset_str[4:6])
                     offset_delta = timedelta(hours=hours, minutes=minutes) * sign
                     news_utc = (news_dt - offset_delta).replace(tzinfo=pytz.utc)
                     time_diff = (news_utc - now_utc).total_seconds()
-                    if -3600 < time_diff < 86400:
+                    if -3600 < time_diff < 129600:
                         news_vn = news_utc + timedelta(hours=7)
+                        day_str = news_vn.strftime('%a %d/%m')
                         time_str = news_vn.strftime('%H:%M')
-                        upcoming.append(f"• <b>{time_str}:</b> {item['title']}")
+                        upcoming.append(f"• {day_str} <b>{time_str}:</b> {item['title']}")
                 except: continue
         return upcoming[:5]
     except: return []
 
 def get_yahoo_data(symbol):
+    """
+    Sửa đổi để trả về thêm biến động 2 ngày và 3 ngày
+    """
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=5d"
         r = requests.get(url, headers=headers, timeout=5)
         data = r.json()
         closes = [c for c in data['chart']['result'][0]['indicators']['quote'][0]['close'] if c is not None]
-        if len(closes) >= 2:
-            cur = closes[-1]; prev = closes[-2]
-            return cur, cur - prev, (cur - prev)/prev*100
+        
+        if len(closes) < 2: return None
+        
+        cur = closes[-1]
+        prev = closes[-2]
+        change = cur - prev
+        pct = (change / prev) * 100
+        
+        # Tính biến động 2 ngày (So với đóng cửa 2 phiên trước)
+        pct_2d = 0.0
+        if len(closes) >= 3:
+            pct_2d = ((cur - closes[-3]) / closes[-3]) * 100
+            
+        # Tính biến động 3 ngày (So với đóng cửa 3 phiên trước)
+        pct_3d = 0.0
+        if len(closes) >= 4:
+            pct_3d = ((cur - closes[-4]) / closes[-4]) * 100
+            
+        # Trả về dạng Dictionary đầy đủ
+        return {
+            'p': cur, 
+            'c': change, 
+            'pct': pct, 
+            'pct_2d': pct_2d, 
+            'pct_3d': pct_3d
+        }
     except: return None
 
 def update_macro_data():
@@ -165,17 +193,19 @@ def update_macro_data():
 
     if current_time - GLOBAL_CACHE['last_success_time'] < 300: return
 
+    # Cập nhật dữ liệu mở rộng
     res = get_yahoo_data("^VIX")
-    if res: GLOBAL_CACHE['vix'] = {'p': res[0], 'c': res[1], 'pct': res[2]}
+    if res: GLOBAL_CACHE['vix'] = res
+    
     res = get_yahoo_data("^GVZ")
-    if res: GLOBAL_CACHE['gvz'] = {'p': res[0], 'c': res[1], 'pct': res[2]}
+    if res: GLOBAL_CACHE['gvz'] = res
+    
     res = get_yahoo_data("^MOVE")
-    if res: GLOBAL_CACHE['move'] = {'p': res[0], 'c': res[1], 'pct': res[2]}
+    if res: GLOBAL_CACHE['move'] = res
     
     GLOBAL_CACHE['last_success_time'] = current_time
 
 def get_data_final():
-    # Gọi hàm update có kiểm tra thời gian
     update_gold_data()
     try: update_macro_data()
     except: pass
@@ -185,7 +215,7 @@ def get_data_final():
 # 4. ROUTING
 # ==============================================================================
 @app.route('/')
-def home(): return "Bot V102 - 2 Min Gold"
+def home(): return "Bot V104 - Multi-Day Alerts"
 
 @app.route('/test')
 def run_test():
@@ -200,7 +230,7 @@ def run_check():
         alerts = []
         now = time.time()
         
-        # CẢNH BÁO
+        # --- CẢNH BÁO VÀNG ---
         if gold['p'] > 0:
             if gold['rsi'] > CONFIG['RSI_HIGH'] and gold['h1'] > CONFIG['RSI_PRICE_MOVE']:
                 if now - last_alert_times.get('RSI', 0) > CONFIG['ALERT_COOLDOWN']:
@@ -215,18 +245,33 @@ def run_check():
                     alerts.append(f"🚨 <b>VÀNG SỐC:</b> H1 biến động {gold['h1']:.1f} giá")
                     last_alert_times['H1'] = now
 
+        # --- CẢNH BÁO BIẾN ĐỘNG (1 NGÀY) ---
         if macro['move']['pct'] > CONFIG['MOVE_PCT_LIMIT']:
-             if now - last_alert_times.get('MOVE', 0) > CONFIG['ALERT_COOLDOWN']:
-                alerts.append(f"🌋 <b>MOVE SỐC:</b> +{macro['move']['pct']:.2f}%")
-                last_alert_times['MOVE'] = now
+             if now - last_alert_times.get('MOVE_1D', 0) > CONFIG['ALERT_COOLDOWN']:
+                alerts.append(f"🌋 <b>MOVE SỐC (1D):</b> +{macro['move']['pct']:.2f}%")
+                last_alert_times['MOVE_1D'] = now
         if macro['vix']['p'] > CONFIG['VIX_VAL_LIMIT'] or macro['vix']['pct'] > CONFIG['VIX_PCT_LIMIT']:
              if now - last_alert_times.get('VIX', 0) > CONFIG['ALERT_COOLDOWN']:
                 alerts.append(f"⚠️ <b>VIX BÁO ĐỘNG:</b> {macro['vix']['p']:.2f}")
                 last_alert_times['VIX'] = now
         if macro['gvz']['p'] > CONFIG['GVZ_VAL_LIMIT'] or macro['gvz']['pct'] > CONFIG['GVZ_PCT_LIMIT']:
-             if now - last_alert_times.get('GVZ', 0) > CONFIG['ALERT_COOLDOWN']:
-                alerts.append(f"🌪 <b>GVZ BÁO ĐỘNG:</b> {macro['gvz']['p']:.2f}")
-                last_alert_times['GVZ'] = now
+             if now - last_alert_times.get('GVZ_1D', 0) > CONFIG['ALERT_COOLDOWN']:
+                alerts.append(f"🌪 <b>GVZ BÁO ĐỘNG (1D):</b> {macro['gvz']['p']:.2f}")
+                last_alert_times['GVZ_1D'] = now
+
+        # --- CẢNH BÁO BIẾN ĐỘNG MỚI (ĐA NGÀY) ---
+        
+        # MOVE tăng > 10% trong 3 ngày
+        if macro['move']['pct_3d'] > CONFIG['MOVE_3D_LIMIT']:
+             if now - last_alert_times.get('MOVE_3D', 0) > CONFIG['ALERT_COOLDOWN']:
+                alerts.append(f"🌋 <b>MOVE BÃO LỚN (3D):</b> Tăng {macro['move']['pct_3d']:.2f}% trong 3 ngày qua!")
+                last_alert_times['MOVE_3D'] = now
+        
+        # GVZ tăng > 10% trong 2 ngày
+        if macro['gvz']['pct_2d'] > CONFIG['GVZ_2D_LIMIT']:
+             if now - last_alert_times.get('GVZ_2D', 0) > CONFIG['ALERT_COOLDOWN']:
+                alerts.append(f"🌪 <b>GVZ BẤT ỔN (2D):</b> Tăng {macro['gvz']['pct_2d']:.2f}% trong 2 ngày qua!")
+                last_alert_times['GVZ_2D'] = now
 
         if alerts:
             send_tele(f"🔥🔥 <b>CẢNH BÁO KHẨN</b> 🔥🔥\n\n" + "\n".join(alerts))
@@ -247,7 +292,7 @@ def run_check():
             news_section = ""
             if macro['news']:
                 news_txt = "\n".join(macro['news'])
-                news_section = f"📰 <b>TIN ĐỎ USD (24H):</b>\n{news_txt}\n-------------------------------\n"
+                news_section = f"📰 <b>TIN ĐỎ USD (36H):</b>\n{news_txt}\n-------------------------------\n"
 
             msg = (
                 f"📊 <b>MARKET DASHBOARD (D1)</b>\n"
