@@ -11,7 +11,7 @@ from dateutil import parser
 app = Flask(__name__)
 
 # ==============================================================================
-# 1. CẤU HÌNH (ĐÃ THÊM NGƯỠNG CẢNH BÁO MỚI)
+# 1. CẤU HÌNH (V105 - FULL ALERT + NEWS)
 # ==============================================================================
 CONFIG = {
     "TELEGRAM_TOKEN": "8309991075:AAFYyjFxQQ8CYECXPKeteeUBXQE3Mx2yfUo",
@@ -22,23 +22,22 @@ CONFIG = {
     "GOLD_H1_LIMIT": 40.0,
     "RSI_HIGH": 82, "RSI_LOW": 18, "RSI_PRICE_MOVE": 30.0,
     
-    # CẢNH BÁO BIẾN ĐỘNG (1 ngày)
+    # CẢNH BÁO BIẾN ĐỘNG (1 NGÀY)
     "VIX_VAL_LIMIT": 30, "VIX_PCT_LIMIT": 15.0,
     "GVZ_VAL_LIMIT": 25, "GVZ_PCT_LIMIT": 10.0,
     "MOVE_PCT_LIMIT": 5.0,
     
-    # CẢNH BÁO BIẾN ĐỘNG (ĐA NGÀY - MỚI)
-    "MOVE_3D_LIMIT": 10.0, # MOVE tăng tổng > 10% trong 3 ngày
-    "GVZ_2D_LIMIT": 10.0,  # GVZ tăng tổng > 10% trong 2 ngày
+    # CẢNH BÁO BIẾN ĐỘNG (ĐA NGÀY - TỪ V104)
+    "MOVE_3D_LIMIT": 10.0, 
+    "GVZ_2D_LIMIT": 10.0,
     
     "ALERT_COOLDOWN": 3600,
-    "NEWS_CACHE_TIME": 3600, 
-    "GOLD_CACHE_TIME": 120
+    "NEWS_CACHE_TIME": 3600, # 1 Tiếng
+    "GOLD_CACHE_TIME": 120   # 2 Phút
 }
 
 GLOBAL_CACHE = {
     'gold': {'p': 0, 'c': 0, 'pct': 0, 'h1': 0, 'rsi': 50, 'src': 'Khởi động...'},
-    # Các cache vĩ mô giờ sẽ chứa thêm pct_2d, pct_3d
     'vix': {'p': 0, 'c': 0, 'pct': 0, 'pct_2d': 0, 'pct_3d': 0},
     'gvz': {'p': 0, 'c': 0, 'pct': 0, 'pct_2d': 0, 'pct_3d': 0},
     'move': {'p': 0, 'c': 0, 'pct': 0, 'pct_2d': 0, 'pct_3d': 0},
@@ -60,7 +59,7 @@ def send_tele(msg):
     except: pass
 
 # ==============================================================================
-# 2. HÀM LẤY VÀNG (GIỮ NGUYÊN)
+# 2. HÀM LẤY VÀNG (2 PHÚT/LẦN)
 # ==============================================================================
 def calculate_rsi_safe(prices, period=14):
     clean_prices = [p for p in prices if p > 0]
@@ -113,7 +112,7 @@ def update_gold_data():
         GLOBAL_CACHE['last_gold_time'] = current_time
 
 # ==============================================================================
-# 3. MACRO & TIN TỨC (SỬA HÀM YAHOO ĐỂ TÍNH 2D, 3D)
+# 3. MACRO & TIN TỨC (ĐÃ SỬA LỖI HIỂN THỊ TIN TỨC)
 # ==============================================================================
 def get_ff_news():
     try:
@@ -135,9 +134,11 @@ def get_ff_news():
                     offset_delta = timedelta(hours=hours, minutes=minutes) * sign
                     news_utc = (news_dt - offset_delta).replace(tzinfo=pytz.utc)
                     time_diff = (news_utc - now_utc).total_seconds()
+                    
+                    # Lấy tin trong 36h tới (1.5 ngày)
                     if -3600 < time_diff < 129600:
                         news_vn = news_utc + timedelta(hours=7)
-                        day_str = news_vn.strftime('%a %d/%m')
+                        day_str = news_vn.strftime('%d/%m')
                         time_str = news_vn.strftime('%H:%M')
                         upcoming.append(f"• {day_str} <b>{time_str}:</b> {item['title']}")
                 except: continue
@@ -145,9 +146,6 @@ def get_ff_news():
     except: return []
 
 def get_yahoo_data(symbol):
-    """
-    Sửa đổi để trả về thêm biến động 2 ngày và 3 ngày
-    """
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=5d"
@@ -157,49 +155,33 @@ def get_yahoo_data(symbol):
         
         if len(closes) < 2: return None
         
-        cur = closes[-1]
-        prev = closes[-2]
+        cur = closes[-1]; prev = closes[-2]
         change = cur - prev
         pct = (change / prev) * 100
         
-        # Tính biến động 2 ngày (So với đóng cửa 2 phiên trước)
-        pct_2d = 0.0
-        if len(closes) >= 3:
-            pct_2d = ((cur - closes[-3]) / closes[-3]) * 100
+        pct_2d = ((cur - closes[-3]) / closes[-3]) * 100 if len(closes) >= 3 else 0.0
+        pct_3d = ((cur - closes[-4]) / closes[-4]) * 100 if len(closes) >= 4 else 0.0
             
-        # Tính biến động 3 ngày (So với đóng cửa 3 phiên trước)
-        pct_3d = 0.0
-        if len(closes) >= 4:
-            pct_3d = ((cur - closes[-4]) / closes[-4]) * 100
-            
-        # Trả về dạng Dictionary đầy đủ
-        return {
-            'p': cur, 
-            'c': change, 
-            'pct': pct, 
-            'pct_2d': pct_2d, 
-            'pct_3d': pct_3d
-        }
+        return {'p': cur, 'c': change, 'pct': pct, 'pct_2d': pct_2d, 'pct_3d': pct_3d}
     except: return None
 
 def update_macro_data():
     global GLOBAL_CACHE
     current_time = time.time()
     
+    # Tin tức: Cập nhật mỗi 1 tiếng
     if current_time - GLOBAL_CACHE['last_news_time'] > CONFIG['NEWS_CACHE_TIME']:
         news = get_ff_news()
         if news: GLOBAL_CACHE['news'] = news
         GLOBAL_CACHE['last_news_time'] = current_time
 
+    # Vĩ mô: Cập nhật mỗi 5 phút
     if current_time - GLOBAL_CACHE['last_success_time'] < 300: return
 
-    # Cập nhật dữ liệu mở rộng
     res = get_yahoo_data("^VIX")
     if res: GLOBAL_CACHE['vix'] = res
-    
     res = get_yahoo_data("^GVZ")
     if res: GLOBAL_CACHE['gvz'] = res
-    
     res = get_yahoo_data("^MOVE")
     if res: GLOBAL_CACHE['move'] = res
     
@@ -212,15 +194,15 @@ def get_data_final():
     return GLOBAL_CACHE['gold'], GLOBAL_CACHE
 
 # ==============================================================================
-# 4. ROUTING
+# 4. ROUTING & RUN
 # ==============================================================================
 @app.route('/')
-def home(): return "Bot V104 - Multi-Day Alerts"
+def home(): return "Bot V105 - News Restored"
 
 @app.route('/test')
 def run_test():
     gold, _ = get_data_final()
-    send_tele(f"🔔 TEST OK. Gold: {gold['p']} ({gold['src']})")
+    send_tele(f"🔔 TEST OK. Gold: {gold['p']}")
     return "OK", 200
 
 @app.route('/run_check')
@@ -230,7 +212,7 @@ def run_check():
         alerts = []
         now = time.time()
         
-        # --- CẢNH BÁO VÀNG ---
+        # 1. CẢNH BÁO VÀNG
         if gold['p'] > 0:
             if gold['rsi'] > CONFIG['RSI_HIGH'] and gold['h1'] > CONFIG['RSI_PRICE_MOVE']:
                 if now - last_alert_times.get('RSI', 0) > CONFIG['ALERT_COOLDOWN']:
@@ -245,7 +227,7 @@ def run_check():
                     alerts.append(f"🚨 <b>VÀNG SỐC:</b> H1 biến động {gold['h1']:.1f} giá")
                     last_alert_times['H1'] = now
 
-        # --- CẢNH BÁO BIẾN ĐỘNG (1 NGÀY) ---
+        # 2. CẢNH BÁO BIẾN ĐỘNG (1 NGÀY)
         if macro['move']['pct'] > CONFIG['MOVE_PCT_LIMIT']:
              if now - last_alert_times.get('MOVE_1D', 0) > CONFIG['ALERT_COOLDOWN']:
                 alerts.append(f"🌋 <b>MOVE SỐC (1D):</b> +{macro['move']['pct']:.2f}%")
@@ -259,15 +241,12 @@ def run_check():
                 alerts.append(f"🌪 <b>GVZ BÁO ĐỘNG (1D):</b> {macro['gvz']['p']:.2f}")
                 last_alert_times['GVZ_1D'] = now
 
-        # --- CẢNH BÁO BIẾN ĐỘNG MỚI (ĐA NGÀY) ---
-        
-        # MOVE tăng > 10% trong 3 ngày
+        # 3. CẢNH BÁO BIẾN ĐỘNG MỚI (ĐA NGÀY - TỪ V104)
         if macro['move']['pct_3d'] > CONFIG['MOVE_3D_LIMIT']:
              if now - last_alert_times.get('MOVE_3D', 0) > CONFIG['ALERT_COOLDOWN']:
                 alerts.append(f"🌋 <b>MOVE BÃO LỚN (3D):</b> Tăng {macro['move']['pct_3d']:.2f}% trong 3 ngày qua!")
                 last_alert_times['MOVE_3D'] = now
         
-        # GVZ tăng > 10% trong 2 ngày
         if macro['gvz']['pct_2d'] > CONFIG['GVZ_2D_LIMIT']:
              if now - last_alert_times.get('GVZ_2D', 0) > CONFIG['ALERT_COOLDOWN']:
                 alerts.append(f"🌪 <b>GVZ BẤT ỔN (2D):</b> Tăng {macro['gvz']['pct_2d']:.2f}% trong 2 ngày qua!")
@@ -289,10 +268,12 @@ def run_check():
             gold_p = f"{gold['p']:.1f}" if gold['p'] > 0 else "N/A"
             rsi_val = f"{gold['rsi']:.1f}" if gold['rsi'] > 0 else "N/A"
             
+            # --- PHẦN HIỂN THỊ TIN TỨC (ĐÃ SỬA LỖI) ---
             news_section = ""
             if macro['news']:
                 news_txt = "\n".join(macro['news'])
                 news_section = f"📰 <b>TIN ĐỎ USD (36H):</b>\n{news_txt}\n-------------------------------\n"
+            # ------------------------------------------
 
             msg = (
                 f"📊 <b>MARKET DASHBOARD (D1)</b>\n"
